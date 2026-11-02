@@ -1,0 +1,2 @@
+# Optional NVIDIA runtime, installed only in this application's environment.
+cupy-cuda12x[ctk]==14.1.0

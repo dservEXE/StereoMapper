@@ -1,0 +1,46 @@
+name: Build and publish StereoMap update
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: stereomap-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Read version
+        shell: pwsh
+        run: |
+          $v=[regex]::Match((Get-Content stereo/version.py -Raw),'"([0-9.]+)"').Groups[1].Value
+          "VERSION=$v" >> $env:GITHUB_ENV
+          gh release view "v$v" --json tagName 2>$null
+          if($LASTEXITCODE -eq 0){'PUBLISHED=true' >> $env:GITHUB_ENV}else{'PUBLISHED=false' >> $env:GITHUB_ENV}
+          exit 0
+      - name: Verify updater without cameras or GPU
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_updates.py -v
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: Build code-only installer
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path stereo -DestinationPath dist/payload.zip
+          ./packaging/build-setup.ps1 -Product StereoMap -Folder StereoMapper -Executable StereoMapper.exe -Version $env:VERSION -CodeOnly
+      - name: Publish optional update
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          gh release create "v$env:VERSION" dist/StereoMap-Setup.exe --target $env:GITHUB_SHA --title "StereoMap $env:VERSION" --notes 'Code update for an existing StereoMapper Windows folder. Select the folder with StereoMapper.exe and runtime once. Python, CUDA, models, photos, maps and calibration are preserved. Future updates are optional inside the app.' --latest
+          if($LASTEXITCODE -ne 0){throw 'Release publication failed.'}

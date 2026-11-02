@@ -1,0 +1,527 @@
+{
+  "python": "3.12.14",
+  "model": {
+    "id": "depth-anything/Depth-Anything-V2-Small-hf",
+    "revision": "5426e4f0f36572d16453bbda7a8389317b1bef99",
+    "license": "Apache-2.0",
+    "model_card_source": "https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf/blob/5426e4f0f36572d16453bbda7a8389317b1bef99/README.md"
+  },
+  "packages": [
+    {
+      "name": "certifi",
+      "version": "2026.7.22",
+      "license": "MPL-2.0",
+      "home_page": "https://github.com/certifi/python-certifi",
+      "license_files": [
+        "packages/certifi-2026.7.22/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "charset-normalizer",
+      "version": "3.5.2",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/charset-normalizer-3.5.2/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": [
+        "packages/colorama-0.4.6/licenses/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "cuda-pathfinder",
+      "version": "1.8.3",
+      "license": "Apache-2.0",
+      "home_page": null,
+      "license_files": [
+        "packages/cuda-pathfinder-1.8.3/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "cuda-toolkit",
+      "version": "12.9.2.0",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": []
+    },
+    {
+      "name": "cupy-cuda12x",
+      "version": "14.1.0",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/cupy-cuda12x-14.1.0/licenses/LICENSE",
+        "packages/cupy-cuda12x-14.1.0/licenses/docs/source/license.rst"
+      ]
+    },
+    {
+      "name": "filelock",
+      "version": "3.32.3",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/filelock-3.32.3/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "fsspec",
+      "version": "2026.7.0",
+      "license": "BSD-3-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/fsspec-2026.7.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "huggingface_hub",
+      "version": "0.36.2",
+      "license": "Apache",
+      "home_page": "https://github.com/huggingface/huggingface_hub",
+      "license_files": [
+        "packages/huggingface_hub-0.36.2/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "idna",
+      "version": "3.20",
+      "license": "BSD-3-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/idna-3.20/licenses/LICENSE.md"
+      ]
+    },
+    {
+      "name": "iniconfig",
+      "version": "2.3.1",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/iniconfig-2.3.1/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": [
+        "packages/Jinja2-3.1.6/licenses/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "license": "BSD-3-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/MarkupSafe-3.0.3/licenses/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "mpmath",
+      "version": "1.3.0",
+      "license": "BSD",
+      "home_page": "http://mpmath.org/",
+      "license_files": [
+        "packages/mpmath-1.3.0/LICENSE"
+      ]
+    },
+    {
+      "name": "networkx",
+      "version": "3.6.1",
+      "license": "BSD-3-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/networkx-3.6.1/licenses/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "numpy",
+      "version": "2.5.4",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "home_page": null,
+      "license_files": [
+        "packages/numpy-2.5.4/licenses/LICENSE.txt",
+        "packages/numpy-2.5.4/licenses/numpy/_core/include/numpy/libdivide/LICENSE.txt",
+        "packages/numpy-2.5.4/licenses/numpy/_core/src/common/pythoncapi-compat/COPYING",
+        "packages/numpy-2.5.4/licenses/numpy/_core/src/highway/LICENSE",
+        "packages/numpy-2.5.4/licenses/numpy/_core/src/multiarray/dragon4_LICENSE.txt",
+        "packages/numpy-2.5.4/licenses/numpy/_core/src/npysort/x86-simd-sort/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/_core/src/umath/svml/LICENSE",
+        "packages/numpy-2.5.4/licenses/numpy/fft/pocketfft/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/linalg/lapack_lite/LICENSE.txt",
+        "packages/numpy-2.5.4/licenses/numpy/ma/LICENSE",
+        "packages/numpy-2.5.4/licenses/numpy/random/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/distributions/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/mt19937/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/pcg64/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/philox/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/sfc64/LICENSE.md",
+        "packages/numpy-2.5.4/licenses/numpy/random/src/splitmix64/LICENSE.md"
+      ]
+    },
+    {
+      "name": "nvidia-cublas-cu12",
+      "version": "12.9.2.10",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cublas-cu12-12.9.2.10/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-cuda-nvrtc-cu12",
+      "version": "12.9.86",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cuda-nvrtc-cu12-12.9.86/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-cuda-runtime-cu12",
+      "version": "12.9.79",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cuda-runtime-cu12-12.9.79/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-cufft-cu12",
+      "version": "11.4.1.4",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cufft-cu12-11.4.1.4/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-curand-cu12",
+      "version": "10.3.10.19",
+      "license": "NVIDIA Proprietary Software",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-curand-cu12-10.3.10.19/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-cusolver-cu12",
+      "version": "11.7.5.82",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cusolver-cu12-11.7.5.82/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-cusparse-cu12",
+      "version": "12.5.10.65",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-cusparse-cu12-12.5.10.65/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "nvidia-nvjitlink-cu12",
+      "version": "12.9.86",
+      "license": "LicenseRef-NVIDIA-Proprietary",
+      "home_page": "https://developer.nvidia.com/cuda-zone",
+      "license_files": [
+        "packages/nvidia-nvjitlink-cu12-12.9.86/licenses/License.txt"
+      ]
+    },
+    {
+      "name": "opencv-contrib-python",
+      "version": "4.14.0.94",
+      "license": "Apache 2.0",
+      "home_page": "https://github.com/opencv/opencv-python",
+      "license_files": [
+        "packages/opencv-contrib-python-4.14.0.94/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "license": "Apache-2.0 OR BSD-2-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/packaging-26.3/licenses/LICENSE",
+        "packages/packaging-26.3/licenses/LICENSE.APACHE",
+        "packages/packaging-26.3/licenses/LICENSE.BSD"
+      ]
+    },
+    {
+      "name": "pillow",
+      "version": "12.3.0",
+      "license": "MIT-CMU",
+      "home_page": null,
+      "license_files": [
+        "packages/pillow-12.3.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pluggy",
+      "version": "1.7.0",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/pluggy-1.7.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "Pygments",
+      "version": "2.21.0",
+      "license": "BSD-2-Clause",
+      "home_page": null,
+      "license_files": [
+        "packages/Pygments-2.21.0/licenses/AUTHORS",
+        "packages/Pygments-2.21.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "pytest",
+      "version": "9.1.1",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/pytest-9.1.1/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "PyYAML",
+      "version": "6.0.3",
+      "license": "MIT",
+      "home_page": "https://pyyaml.org/",
+      "license_files": [
+        "packages/PyYAML-6.0.3/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "regex",
+      "version": "2026.9.29",
+      "license": "Apache-2.0 AND CNRI-Python",
+      "home_page": null,
+      "license_files": [
+        "packages/regex-2026.9.29/licenses/LICENSE.txt"
+      ]
+    },
+    {
+      "name": "requests",
+      "version": "2.34.2",
+      "license": "Apache-2.0",
+      "home_page": null,
+      "license_files": [
+        "packages/requests-2.34.2/licenses/LICENSE",
+        "packages/requests-2.34.2/licenses/NOTICE"
+      ]
+    },
+    {
+      "name": "safetensors",
+      "version": "0.8.0",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": [
+        "packages/safetensors-0.8.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "setuptools",
+      "version": "78.1.0",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": [
+        "packages/setuptools-78.1.0/licenses/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/licenses/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE",
+        "packages/setuptools-78.1.0/LICENSE.txt",
+        "packages/setuptools-78.1.0/LICENSE"
+      ]
+    },
+    {
+      "name": "sympy",
+      "version": "1.14.0",
+      "license": "BSD",
+      "home_page": "https://sympy.org",
+      "license_files": [
+        "packages/sympy-1.14.0/licenses/AUTHORS",
+        "packages/sympy-1.14.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "tokenizers",
+      "version": "0.22.2",
+      "license": "See package licenses",
+      "home_page": null,
+      "license_files": []
+    },
+    {
+      "name": "torch",
+      "version": "2.14.1+cpu",
+      "license": "Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/torch-2.14.1+cpu/licenses/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/FP16/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/FXdiv/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NNPACK/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NVTX/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NVTX/docs/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NVTX/python/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NVTX/rust/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/NVTX/tools/docs/github-markdown-css/license",
+        "packages/torch-2.14.1+cpu/licenses/third_party/VulkanMemoryAllocator/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/XNNPACK/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/aiter/3rdparty/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/aiter/3rdparty/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/aiter/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/benchmark/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cpp-httplib/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cpuinfo/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cpuinfo/deps/clog/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cudnn_frontend/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cutlass/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/cutlass/python/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/cpuinfo/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/cpuinfo/deps/clog/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/cutlass/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/cutlass/python/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/external/hipify_torch/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/fbgemm_gpu/docs/src/general/License.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/fbgemm_gpu/experimental/hstu/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/fbgemm_gpu/src/quantize_ops/mx/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fbgemm/fbgemm_gpu/test/quantize/mx/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/csrc/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/csrc/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/csrc/cutlass/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/csrc/cutlass/python/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/flash_attn/cute/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/third_party/aiter/3rdparty/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/third_party/aiter/3rdparty/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flash-attention/third_party/aiter/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flatbuffers/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flatbuffers/dart/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/flatbuffers/swift/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/fmt/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/gemmlowp/gemmlowp/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/gloo/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/ideep/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/ideep/mkl-dnn/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/ideep/mkl-dnn/third_party/gtest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/ideep/mkl-dnn/third_party/opencl/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/kineto/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/kineto/libkineto/third_party/dynolog_headers/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/kineto/libkineto/third_party/fmt/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/kineto/libkineto/third_party/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/llvm-openmp/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mimalloc/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/miniz-3.0.2/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/composable_kernel/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/composable_kernel/docs/license.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/cutlass/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/cutlass/python/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/external/hipify_torch/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/mslk/mslk/attention/flash_attn/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/onnx/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/onnx/third_party/pybind11/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/perfetto/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/benchmark/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/googletest/googlemock/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/googletest/googlemock/scripts/generator/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/googletest/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/protobuf/third_party/utf8_range/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/psimd/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/pthreadpool/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/pybind11/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/python-peachpy/LICENSE.rst",
+        "packages/torch-2.14.1+cpu/licenses/third_party/sleef/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/LICENSE.txt",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/googletest/googlemock/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/googletest/googlemock/scripts/generator/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/googletest/googletest/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/libnop/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/libuv/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/pybind11/LICENSE",
+        "packages/torch-2.14.1+cpu/licenses/third_party/tensorpipe/third_party/pybind11/tools/clang/LICENSE.TXT"
+      ]
+    },
+    {
+      "name": "tqdm",
+      "version": "4.70.1",
+      "license": "MPL-2.0 AND MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/tqdm-4.70.1/licenses/LICENCE"
+      ]
+    },
+    {
+      "name": "transformers",
+      "version": "4.57.6",
+      "license": "Apache 2.0 License",
+      "home_page": "https://github.com/huggingface/transformers",
+      "license_files": [
+        "packages/transformers-4.57.6/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "license": "PSF-2.0",
+      "home_page": null,
+      "license_files": [
+        "packages/typing_extensions-4.16.0/licenses/LICENSE"
+      ]
+    },
+    {
+      "name": "urllib3",
+      "version": "2.8.0",
+      "license": "MIT",
+      "home_page": null,
+      "license_files": [
+        "packages/urllib3-2.8.0/licenses/LICENSE.txt"
+      ]
+    }
+  ],
+  "microsoft_visual_cpp_runtime": {
+    "version": "14.51.36247.0",
+    "architecture": "x64 (AMD64)",
+    "source_url": "https://aka.ms/vc14/vc_redist.x64.exe",
+    "source_sha256": "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c",
+    "authenticode": "Valid — Microsoft Corporation",
+    "license_url": "https://aka.ms/VCRedistLicense",
+    "resolved_license_url": "https://visualstudio.microsoft.com/license-terms/vs2026-ga-visualcpp-v14-redist-runtime/",
+    "extraction": "WiX dark.exe 3.14.1.8722, extract bundle then vc_runtimeMinimum_x64.msi; no system installation"
+  }
+}

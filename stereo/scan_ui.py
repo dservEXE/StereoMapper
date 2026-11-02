@@ -1,0 +1,80 @@
+"""A scan session with clear preparation, progress and result states."""
+import tkinter as tk
+from tkinter import ttk
+from .ui import apply_theme, ScrolledFrame, Foldout, note
+from .help_ui import help_icon
+
+
+def build(scan,app):
+    from .app import ImagePanel
+    apply_theme(app.root)
+    scan.window.title("Новый 3D-скан · StereoMapper")
+    scan.window.geometry("1180x840"); scan.window.minsize(1000,680)
+    header=ttk.Frame(scan.window,padding=(20,16)); header.pack(fill="x")
+    ttk.Label(header,text="Новый 3D-скан",style="Heading.TLabel").pack(side="left")
+    help_icon(header,"object_scan").pack(side="right")
+    ttk.Label(header,text="Подготовка  →  Съёмка  →  Готовая карта",style="Muted.TLabel").pack(side="right",padx=14)
+    body=ttk.Frame(scan.window,padding=(16,0)); body.pack(fill="both",expand=True)
+    sidebar=ttk.Frame(body,width=320,style="Card.TFrame"); sidebar.pack(side="left",fill="y",padx=(0,12)); sidebar.pack_propagate(False)
+    buttons=ttk.Frame(sidebar,padding=12); buttons.pack(side="bottom",fill="x")
+    pane=ScrolledFrame(sidebar); pane.pack(fill="both",expand=True); settings=pane.content
+    ttk.Label(settings,text="Перед началом",style="Section.TLabel").pack(anchor="w")
+    note(settings,"Предмет неподвижен, свет ровный. Держите стереопару горизонтально: левая камера слева по направлению взгляда.")
+    scan.width=tk.StringVar(value="Оригинал"); scan.maximum=tk.StringVar(value="60"); scan.voxel=tk.StringVar(value="1")
+    scan.auto=tk.BooleanVar(value=True)
+    scan.max_depth=tk.StringVar(value=str(app.worker.max_depth if app.worker else 1.2))
+    scan.near_minimum=tk.StringVar(value=f"{app.worker.near_minimum*100:g}" if app.worker else "10")
+    scan.ghost_filter=tk.StringVar(value="Строгая" if app.worker and app.worker.ghost_filter=="strict" else "Обычная")
+    scan.controls=[]
+    def field(parent,label,var,values,key=None):
+        row=ttk.Frame(parent); row.pack(fill="x",pady=5)
+        ttk.Label(row,text=label,wraplength=145).pack(side="left")
+        if key:help_icon(row,key).pack(side="right",padx=(5,0))
+        combo=ttk.Combobox(row,textvariable=var,values=values,width=8,state="readonly")
+        combo.pack(side="right"); scan.controls.append(combo)
+    field(settings,"Глубина до, м",scan.max_depth,("0.5","0.8","1.2","2","3","5","8"),"max_depth")
+    field(settings,"Время, сек",scan.maximum,("30","60","120","0"))
+    field(settings,"Шаг точек, мм",scan.voxel,("0.5","1","2"),"voxel_mm")
+    note(settings,"0 убирает лимит времени. Автостоп может завершить скан раньше. Шаг точек задаёт плотность карты.")
+    scan.auto_control=ttk.Checkbutton(settings,text="Завершать при замедлении прироста",variable=scan.auto)
+    scan.auto_control.pack(anchor="w",pady=5)
+    note(settings,"Автостоп работает после 5 секунд и 90% покрытия выбранной области первого ракурса.")
+    more=Foldout(settings,"Дополнительные настройки"); more.pack(fill="x",pady=6)
+    field(more.content,"Ширина расчёта",scan.width,("Оригинал","1280","960"),"processing_width")
+    field(more.content,"Поиск от, см",scan.near_minimum,("5","10","15","20","30","50"),"near_minimum_cm")
+    field(more.content,"Защита от выбросов",scan.ghost_filter,("Обычная","Строгая"),"ghost_filter")
+    ttk.Button(more.content,text="Убрать область контроля",command=scan.clear_region).pack(fill="x",pady=8)
+    scan.region_text=tk.StringVar(value="Необязательно: двумя щелчками на изображении задайте область контроля покрытия. Сохраняется вся измеренная сцена.")
+    note(settings,variable=scan.region_text)
+    scan.start_button=ttk.Button(buttons,text="Начать сканирование",command=scan.start,style="Accent.TButton")
+    scan.start_button.pack(fill="x",pady=3)
+    scan.stop_button=ttk.Button(buttons,text="Завершить и сохранить",command=lambda:app.send("scan_stop"),state="disabled")
+    scan.stop_button.pack(fill="x",pady=3)
+    scan.extend_button=ttk.Button(buttons,text="Продолжать без автостопа",command=lambda:app.send("scan_extend"),state="disabled")
+    scan.extend_button.pack(fill="x",pady=3)
+    scan.view_button=ttk.Button(buttons,text="Открыть результат в 3D",command=scan.view,state="disabled")
+    scan.view_button.pack(fill="x",pady=(12,3))
+    pane.attach_wheel()
+    workspace=ttk.Frame(body); workspace.pack(side="left",fill="both",expand=True)
+    scan.phase=tk.StringVar(value="Готовы к съёмке")
+    scan.summary=tk.StringVar(value="Нажмите «Начать сканирование», затем медленно меняйте ракурс камеры.")
+    ttk.Label(workspace,textvariable=scan.phase,style="Section.TLabel").pack(anchor="w")
+    note(workspace,variable=scan.summary,width=800)
+    panels=ttk.Frame(workspace); panels.pack(fill="both",expand=True)
+    panels.columnconfigure((0,1),weight=1,uniform="scan"); panels.rowconfigure(0,weight=1)
+    scan.left=ImagePanel(panels,"Сцена и измеренная глубина",scan.pick,empty="Проверьте сцену",hint="После начала здесь будет показана глубина")
+    scan.right=ImagePanel(panels,"Где уже есть измерения",empty="Покрытие появится во время съёмки",hint="Зелёным отмечаются измеренные участки первого ракурса")
+    scan.left.grid(row=0,column=0,sticky="nsew",padx=(0,5)); scan.right.grid(row=0,column=1,sticky="nsew",padx=(5,0))
+    scan.coverage=ttk.Progressbar(workspace,maximum=100); scan.coverage.pack(fill="x",pady=(12,4))
+    scan.coverage_text=tk.StringVar(value="Покрытие первого ракурса: 0%")
+    ttk.Label(workspace,textvariable=scan.coverage_text,style="Muted.TLabel").pack(anchor="w")
+    note(workspace,"Чёрное — достоверной глубины нет. Новые ракурсы могут заполнить пропуски. Процент относится к первому ракурсу, а не ко всем сторонам предмета.",width=800)
+    worker=app.worker
+    if worker and worker.engine and worker.raw:
+        import cv2
+        scan.anchor=cv2.remap(worker.raw[0],*worker.engine.maps[0],cv2.INTER_LINEAR)
+        scan.left.set(scan.anchor)
+    scan.message=tk.StringVar(value="Результат сохраняется автоматически после завершения съёмки.")
+    bottom=ttk.Frame(scan.window,padding=(20,12)); bottom.pack(fill="x")
+    label=ttk.Label(bottom,textvariable=scan.message,wraplength=1100,foreground="#087e80"); label.pack(anchor="w")
+    bottom.bind("<Configure>",lambda e:label.configure(wraplength=max(400,e.width-40)))

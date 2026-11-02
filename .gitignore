@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+data/
+output/
+settings.json
+settings_before_v03.json
+screen_board.json
+models/
+tmp/
+
+dist/
+packaging/vc_runtime/*.dll
+models/
+settings*.json
+screen_board.json
+*.log
