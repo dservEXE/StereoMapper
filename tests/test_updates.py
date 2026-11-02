@@ -1,9 +1,14 @@
 import hashlib
+import importlib.util
 import io
 from pathlib import Path
 import tempfile
 import unittest
-from stereo.updates import select_release, allowed_url, download_release, cleanup
+_spec = importlib.util.spec_from_file_location("checked_updates", Path(__file__).parents[1] / "stereo" / "updates.py")
+_updates = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_updates)
+select_release, allowed_url = _updates.select_release, _updates.allowed_url
+download_release, cleanup = _updates.download_release, _updates.cleanup
 
 
 def metadata(data=b"installer"):
