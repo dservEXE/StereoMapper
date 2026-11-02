@@ -48,6 +48,23 @@ internal static class Setup
         return destination;
     }
     static void DeleteOwned(string directory) { try { if (Directory.Exists(directory)) { Ordinary(directory); Directory.Delete(directory, true); } } catch { } }
+    static void WaitForProcesses(string root, bool updating)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(updating ? 10 : 0);
+        while (true)
+        {
+            bool active = false;
+            foreach (var process in Process.GetProcesses())
+            {
+                try { if (process.Id != Process.GetCurrentProcess().Id && process.MainModule.FileName.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase)) active = true; }
+                catch (System.ComponentModel.Win32Exception) { } catch (InvalidOperationException) { }
+                finally { process.Dispose(); }
+            }
+            if (!active) return;
+            if (DateTime.UtcNow >= deadline) throw new IOException("Сначала полностью закройте " + BuildInfo.Name + ".");
+            System.Threading.Thread.Sleep(100);
+        }
+    }
     static void Shortcut(string root)
     {
         var shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
@@ -75,12 +92,7 @@ internal static class Setup
                 {
                     try { using (var process = Process.GetProcessById(pid)) { if (!string.Equals(Path.GetFullPath(process.MainModule.FileName), Path.GetFullPath(parentPath), StringComparison.OrdinalIgnoreCase)) throw new IOException("Процесс приложения изменился."); if (!process.WaitForExit(30000)) throw new IOException("Приложение не завершилось. Установка отменена."); } } catch (ArgumentException) { }
                 }
-                foreach (var process in Process.GetProcesses())
-                {
-                    try { if (process.Id == Process.GetCurrentProcess().Id) continue; var file = process.MainModule.FileName; if (file.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase)) throw new IOException("Сначала полностью закройте " + BuildInfo.Name + "."); }
-                    catch (System.ComponentModel.Win32Exception) { } catch (InvalidOperationException) { }
-                    finally { process.Dispose(); }
-                }
+                WaitForProcesses(root, pid > 0);
                 if (Directory.Exists(destination)) { Directory.Move(destination, backup); oldMoved = true; }
                 Directory.Move(BuildInfo.CodeOnly ? Path.Combine(stage, "stereo") : stage, destination); newMoved = true;
                 Shortcut(root);

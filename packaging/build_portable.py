@@ -70,7 +70,7 @@ def build():
                              for d in importlib.metadata.distributions(path=[str(SITE)])
                              if not d.metadata["Name"].lower().startswith(("pip", "imageio-ffmpeg"))),
                             key=lambda d: d["name"].lower())
-    manifest = {"application": "StereoMapper", "version": "0.12.1", "platform": "Windows x64",
+    manifest = {"application": "StereoMapper", "version": "0.12.2", "platform": "Windows x64",
                 "built_utc": datetime.now(timezone.utc).isoformat(), "python": sys.version,
                 "offline": True, "components": distributions,
                 "excluded": ["studies", "camera photos", "calibration", "user settings", "logs", "screen scale", "pip", "diagnostic ffmpeg"]}
