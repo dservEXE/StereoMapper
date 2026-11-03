@@ -1,27 +1,33 @@
-# Сборка чистого комплекта Windows x64
+# Windows installer and optional updates
 
-В комплект входит отдельный CPython, стандартная библиотека, Tcl/Tk и локальные
-пакеты приложения. Обычный запуск дочерних процессов и динамические импорты
-CUDA/Transformers сохраняются. Исходная `.venv` и `pyvenv.cfg` не переносятся.
+Build with a Windows x64 Python 3.12 environment containing requirements.txt,
+requirements-photo.txt, requirements_gpu.txt, packaging/requirements-build.txt
+and the CPU PyTorch wheel. Download the pinned model through
+stereo.mono.model_directory before building. Builds must never include user data.
 
-1. В рабочей `.venv` установите `requirements-build.txt` (совместимость
-   последовательного использования CuPy и PyTorch).
-2. Запустите `packaging/build_portable.py` из этой `.venv`. Нужна свободная
-   папка `../Готовая_программа/StereoMapper`: существующая сборка не заменяется.
-3. Выполните проверки `portable_selftest.py --root ПАПКА_КОМПЛЕКТА --report ОТЧЁТ` с
-   `runtime/python.exe -I -X utf8`. Файл проверки остаётся вне дистрибутива.
-4. Запустите `packaging/archive_release.py`. Архив создаётся по списку
-   разрешённых папок и файлов, затем полностью проверяется CRC и SHA-256.
+1. Run packaging/build_portable.py --output dist/app from the build venv.
+   For a verified existing private runtime, use --runtime-source PATH and
+   --models-source PATH. Neither option copies studies or settings.
+2. Run packaging/portable_selftest.py with dist/app/runtime/python.exe and
+   --root dist/app --report REPORT.json. This never opens USB devices.
+3. Run packaging/build-payloads.py --application dist/app --output dist.
+4. Run packaging/build-setup.ps1 -Payload dist/payload.zip -SkipVerify,
+   then run it with -Payload dist/update-payload.zip -CodeOnly.
+5. Verify the full executable using --verify-payload --result REPORT.txt;
+   test a fresh install and preservation of existing user files.
 
-Локальные Microsoft CRT берутся из `vc_runtime/`; происхождение и подписи
-описаны в `licenses/Microsoft-VC-Runtime-PROVENANCE.json`. Системная установка
-Visual C++ Redistributable для комплекта не требуется. Драйвер NVIDIA в него не входит.
+StereoMapper-Setup.exe is a complete offline first installer. It includes a
+private CPython, Tcl/Tk, OpenCV, NumPy, Pillow, local photo model and optional
+CUDA runtime. No Python installation or Git client is required on the target.
+StereoMapper-Update.exe contains application code only and requires an existing
+compatible installation. Both installers validate the payload SHA-256 before
+replacing managed components; data, output, calibration and settings are preserved.
 
-В ZIP никогда не включаются `data`, `output`, `tests`, `tmp`, пользовательская
-калибровка, `settings.json`, `screen_board.json`, журналы и диагностические
-скрипты. Руководства для дистрибутива берутся из `packaging/docs`, без истории
-локальных испытаний. Пользовательские исходные файлы и исследования сохраняются.
+The release workflow publishes both assets when VERSION in stereo/version.py is
+increased on main. Release notes must include StereoMapper-Runtime: 1. If a code
+change requires incompatible dependencies, increase RUNTIME_ABI in updates.py
+and the marker so previous clients offer the full installer instead of a code update.
 
-Всё приложение находится в распакованной папке. `Install.cmd` копирует её в
-папку текущего пользователя и создаёт ярлык. При обновлении существующие
-данные, настройки и калибровка установленной программы сохраняются.
+The installer ZIP is streamed from an overlay after the PE image rather than
+loaded into a .NET resource array. Assets must remain below GitHub's 2 GiB limit.
+Dependency licenses and local MSVC provenance remain in packaging/licenses.

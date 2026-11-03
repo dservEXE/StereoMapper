@@ -1,4 +1,4 @@
-name: Build and publish StereoMap update
+name: Build and publish StereoMapper Windows installers
 on:
   push:
     branches: [main]
@@ -6,21 +6,28 @@ on:
 permissions:
   contents: write
 concurrency:
-  group: stereomap-release
+  group: stereomapper-release
   cancel-in-progress: false
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      PIP_NO_CACHE_DIR: '1'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
       - name: Read version
         shell: pwsh
         run: |
-          $v=[regex]::Match((Get-Content stereo/version.py -Raw),'"([0-9.]+)"').Groups[1].Value
+          $v=[regex]::Match((Get-Content stereo/version.py -Raw),'"(\d+\.\d+\.\d+)"').Groups[1].Value
+          if (-not $v) { throw 'Missing release version.' }
           "VERSION=$v" >> $env:GITHUB_ENV
           gh release view "v$v" --json tagName 2>$null
           if($LASTEXITCODE -eq 0){'PUBLISHED=true' >> $env:GITHUB_ENV}else{'PUBLISHED=false' >> $env:GITHUB_ENV}
@@ -29,18 +36,67 @@ jobs:
         if: env.PUBLISHED == 'false'
         shell: pwsh
         run: |
-          python -m unittest discover -s tests -p test_updates.py -v
+          python -m unittest discover -s tests -p 'test_update*.py' -v
           if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
-      - name: Build code-only installer
+          python -m unittest discover -s tests -p test_installer.py -v
+          if($LASTEXITCODE -ne 0){exit $LASTEXITCODE}
+      - name: Install private build runtime with all application features
         if: env.PUBLISHED == 'false'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
-          Compress-Archive -Path stereo -DestinationPath dist/payload.zip
-          ./packaging/build-setup.ps1 -Product StereoMap -Folder StereoMapper -Executable StereoMapper.exe -Version $env:VERSION -CodeOnly
-      - name: Publish optional update
+          python -m venv .venv
+          .venv/Scripts/python.exe -m pip install -r requirements.txt -r packaging/requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Base dependencies failed.' }
+          .venv/Scripts/python.exe -m pip install 'torch>=2.4,<3' --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { throw 'Photo runtime failed.' }
+          .venv/Scripts/python.exe -m pip install -r requirements-photo.txt -r requirements_gpu.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Photo/CUDA dependencies failed.' }
+          .venv/Scripts/python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency validation failed.' }
+      - name: Download pinned photo model and collect local native redistributables
         if: env.PUBLISHED == 'false'
         shell: pwsh
         run: |
-          gh release create "v$env:VERSION" dist/StereoMap-Setup.exe --target $env:GITHUB_SHA --title "StereoMap $env:VERSION" --notes 'Code update for an existing StereoMapper Windows folder. Select the folder with StereoMapper.exe and runtime once. Python, CUDA, models, photos, maps and calibration are preserved. Future updates are optional inside the app.' --latest
+          .venv/Scripts/python.exe -c "from pathlib import Path; from stereo.mono import model_directory; model_directory(Path.cwd(), print)"
+          if ($LASTEXITCODE -ne 0) { throw 'Photo model download failed.' }
+          New-Item -ItemType Directory packaging/vc_runtime -Force | Out-Null
+          $dlls=@('concrt140.dll','msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcruntime140.dll','vcruntime140_1.dll','vcruntime140_threads.dll','vcomp140.dll','vcamp140.dll','vccorlib140.dll')
+          foreach ($dll in $dlls) {
+            $source=Join-Path $env:SystemRoot ('System32/'+$dll)
+            if (-not (Test-Path -LiteralPath $source)) { throw ('Missing redistributable on build runner: '+$dll) }
+            Copy-Item -LiteralPath $source -Destination packaging/vc_runtime -Force
+          }
+      - name: Build clean standalone application
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          .venv/Scripts/python.exe packaging/build_portable.py --output dist/app
+          if ($LASTEXITCODE -ne 0) { throw 'Standalone application failed.' }
+          dist/app/runtime/python.exe -I -c "import cv2,numpy,PIL,tkinter,torch,transformers,cupy; print('Bundled runtime imports passed')"
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled runtime imports failed.' }
+      - name: Build full installer and small update
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          .venv/Scripts/python.exe packaging/build-payloads.py --application dist/app --output dist
+          if ($LASTEXITCODE -ne 0) { throw 'Clean payload verification failed.' }
+          ./packaging/build-setup.ps1 -Version $env:VERSION -Payload dist/payload.zip -SkipVerify
+          ./packaging/build-setup.ps1 -Version $env:VERSION -Payload dist/update-payload.zip -CodeOnly
+          $check=Start-Process -FilePath dist/StereoMapper-Setup.exe -ArgumentList @('--verify-payload','--result',('"'+$PWD+'/dist/full-installer-verify.txt"')) -WindowStyle Hidden -Wait -PassThru
+          if ($check.ExitCode -ne 0) { throw 'Full installer integrity validation failed.' }
+          foreach ($name in @('StereoMapper-Setup.exe','StereoMapper-Update.exe')) {
+            if ((Get-Item ('dist/'+$name)).Length -ge 2GB) { throw ('GitHub asset exceeds 2 GiB: '+$name) }
+          }
+      - name: Publish Windows release
+        if: env.PUBLISHED == 'false'
+        shell: pwsh
+        run: |
+          @'
+          StereoMapper-Runtime: 1
+
+          Download **StereoMapper-Setup.exe** for a clean first installation on Windows 10/11 x64. Python, OpenCV, photo depth model and optional NVIDIA runtime are included. No previous photographs, calibration or research data are included.
+
+          **StereoMapper-Update.exe** is a small optional update for an already installed compatible application. The application checks for updates and offers a button; calibration, maps, settings, Python, CUDA and models are preserved.
+          '@ | Set-Content -LiteralPath dist/release-notes.md -Encoding utf8
+          gh release create "v$env:VERSION" dist/StereoMapper-Setup.exe dist/StereoMapper-Setup.exe.sha256 dist/StereoMapper-Update.exe dist/StereoMapper-Update.exe.sha256 --target $env:GITHUB_SHA --title "StereoMapper $env:VERSION" --notes-file dist/release-notes.md --latest
           if($LASTEXITCODE -ne 0){throw 'Release publication failed.'}

@@ -707,6 +707,8 @@ class StereoApp:
 
     def close(self):
         self.closing = True
+        if hasattr(self, "updates"):
+            self.updates.close()
         if self.worker:
             self.worker.stop_event.set()
         self.status.set("Освобождаю камеры и закрываю приложение…")
@@ -714,6 +716,8 @@ class StereoApp:
     def on_destroy(self,event):
         if event.widget is self.root:
             self.closing=True
+            if hasattr(self, "updates"):
+                self.updates.close()
             if self.poll_id:
                 try:self.root.after_cancel(self.poll_id)
                 except tk.TclError:pass
