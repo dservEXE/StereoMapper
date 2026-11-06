@@ -1,8 +1,6 @@
 """Theme tokens, the saved interface preferences and the short transitions, without USB devices.
 
-All classes share one Tk root. A Tcl interpreter remembers the OS handles of the standard streams
-for the whole process; pytest's capture frees them, and when Windows reuses one for a script file,
-starting another root can fail with "couldn't read file init.tcl"; new_root() retries for that.
+All classes share one Tk root; tests/conftest.py keeps starting Tk reliable under pytest.
 """
 import faulthandler
 import gc
@@ -14,10 +12,15 @@ from tempfile import TemporaryDirectory
 import time
 import tkinter as tk
 from tkinter import ttk
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 from stereo import ui
 from stereo.app import StereoApp
+from stereo.viewer import COMPASS_LABEL_HEIGHT, COMPASS_LABEL_WIDTH, compass_label_places
 
 
 TEXT_ON_BACKGROUND = (
@@ -86,15 +89,9 @@ class Pending:
 
 
 def new_root():
-    for attempt in range(5):
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            return root
-        except tk.TclError:
-            if attempt == 4:
-                raise
-            time.sleep(.05)
+    root = tk.Tk()
+    root.withdraw()
+    return root
 
 
 def close_root(root):
@@ -231,6 +228,8 @@ class AnimatorTests(unittest.TestCase):
         book.select(pages[1])
         self.root.update()
         self.assertIn(str(book), self.engine.running)
+        self.assertTrue(book.instate(["alternate"]), "user1 and user2 mark the first and last tab")
+        self.assertFalse(set(ui.TAB_FADE_IN[0] + ui.TAB_FADE_IN[1]) & {"user1", "user2"})
         self.pump(.3)
         self.assertEqual(self.engine.running, {})
         self.assertEqual(Pending.timers(self.root), ())
@@ -369,6 +368,70 @@ class SettingsTests(unittest.TestCase):
         finally:
             faulthandler.cancel_dump_traceback_later()
 
+    def test_real_data_form_fits_without_scrolling_and_keeps_its_attributes(self):
+        app = self.open_app()
+        self.window.geometry("1400x860+10+10")
+        app.show_page("weighing")
+        tab = app.weighing_tab
+        tab.views.select(tab.database_page)
+        self.host.update()
+        bottom = tab.add_button.winfo_rooty() + tab.add_button.winfo_height()
+        self.assertTrue(tab.add_button.winfo_viewable())
+        self.assertLessEqual(bottom, tab.database_page.winfo_rooty() + tab.database_page.winfo_height())
+        self.assertTrue(str(tab.source_box).startswith(str(tab.database_page)))
+        for name in ("entry_source", "entry_label", "entry_height", "entry_weight", "entry_sex", "entry_clothing", "entry_scales"):
+            self.assertIsInstance(getattr(tab, name), tk.Variable)
+        self.assertTrue(callable(tab.add_to_database))
+        columns = sum(tab.database_table.column(name, "width") for name in tab.database_table.cget("columns"))
+        self.assertLessEqual(columns, tab.database_table.winfo_width(), "every column shows at this size")
+
+    def test_the_weighing_tab_has_one_main_button_in_each_state(self):
+        app = self.open_app()
+        tab = app.weighing_tab
+        self.assertFalse(tab.available)
+        self.assertEqual(str(tab.download_button.cget("style")), "Accent.TButton")
+        self.assertEqual(str(tab.add_button.cget("style")), "TButton")
+        with patch("stereo.weighing_ui.models_ready", return_value=True):
+            tab.show_download_state()
+        self.assertEqual(str(tab.add_button.cget("style")), "Accent.TButton")
+        self.assertFalse(tab.download_button.winfo_manager())
+
+    def test_choosing_an_experiment_opens_the_form(self):
+        app = self.open_app()
+        tab = app.weighing_tab
+        tab.history_items = [("weighing_20261106_100000", dict(people=[dict(label=1, mass_kg=70., samples=9)]))]
+        tab.history_list.insert("", "end", iid="weighing_20261106_100000", values=("замер",))
+        tab.history_list.selection_set("weighing_20261106_100000")
+        with patch("stereo.weighing_ui.saved_experiments", return_value=tab.history_items):
+            tab.use_experiment()
+        self.assertEqual(tab.views.select(), str(tab.database_page))
+        self.assertIn("06.11 10:00:00", tab.entry_source.get())
+
+    def test_a_resize_repaints_only_the_widgets_that_changed(self):
+        # A nested frame used to be repainted once per resized ancestor.
+        self.app = SimpleNamespace(worker=None)
+        self.window.geometry("600x400+10+10")
+        ui.style_window(self.window)
+        outer = ttk.Frame(self.window)
+        outer.pack(fill="both", expand=True)
+        parent = outer
+        for _ in range(5):
+            parent = ttk.Frame(parent)
+            parent.pack(fill="both", expand=True)
+        still = ttk.Label(parent, text="Подпись")
+        still.place(x=4, y=4)
+        self.host.update()
+        ui.repaint_only_what_changed(self.window)
+        for _ in range(3):
+            self.host.update()
+        exposed = []
+        still.bind("<Expose>", lambda event: exposed.append(event))
+        for width in range(600, 620, 2):
+            self.window.geometry(f"{width}x400")
+            self.host.update()
+        self.assertEqual(exposed, [])
+
+
     def test_an_unwritable_settings_file_only_shows_a_message(self):
         app = self.open_app()
         self.path.mkdir()
@@ -466,6 +529,35 @@ class ThemeCoverageTests(unittest.TestCase):
                 self.assertEqual(int(str(label.cget("wraplength"))), expected, width)
         finally:
             frame.destroy()
+
+    def test_a_small_progress_value_is_drawn_as_a_short_pill(self):
+        bar = ttk.Progressbar(self.root, maximum=100, length=400)
+        bar.pack()
+        self.root.deiconify()
+        self.root.update()
+        try:
+            width = bar.winfo_width()
+            for value, expected in ((0, 0), (.1, 100 * ui.PROGRESS_MIN_PIXELS / width), (50, 50), (100, 100)):
+                ui.show_progress(bar, value)
+                self.assertAlmostEqual(float(bar.cget("value")), expected, places=3)
+        finally:
+            bar.destroy()
+            self.root.withdraw()
+
+    def test_compass_labels_never_cover_each_other(self):
+        for ends in (((105, 300), (105, 302), (70, 262)),        # the opening view: Right and Forward
+                     ((65, 300), (65, 300), (65, 300)),
+                     ((90, 280), (92, 290), (100, 285))):
+            places = compass_label_places(np.array(ends, float))
+            for index, first in enumerate(places):
+                for second in places[index + 1:]:
+                    apart = (abs(first[0] - second[0]) >= COMPASS_LABEL_WIDTH or
+                             abs(first[1] - second[1]) >= COMPASS_LABEL_HEIGHT)
+                    self.assertTrue(apart, (ends, places))
+
+    def test_a_label_with_room_stays_where_it_was(self):
+        places = compass_label_places(np.array(((100, 300), (300, 100)), float))
+        self.assertEqual(places, [(105., 291.), (305., 91.)])
 
     def test_a_dark_title_bar_call_is_safe_before_and_after_mapping(self):
         window = tk.Toplevel(self.root)

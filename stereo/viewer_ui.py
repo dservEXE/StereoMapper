@@ -54,7 +54,6 @@ def build(v):
     v.delete_button=v.button(v.row(edit),"Удалить выбранное",v.delete_selection)
     v.delete_button.configure(style="Danger.TButton")
     v.keep_button=v.button(v.row(edit),"Оставить только выбранное",v.keep_selection)
-    v.keep_button.configure(style="Accent.TButton")
     v.button(v.row(edit),"Снять выделение  ·  Esc",v.clear_selection)
     note(edit,"Ctrl+Z возвращает удалённое. Исходный скан сохраняется.")
     ttk.Separator(edit).pack(fill="x",pady=ui.SPACE_S)
@@ -89,7 +88,6 @@ def build(v):
     v.merge_buttons=[]
     for text,fn in (("1. Указать 3 пары точек",v.start_landmarks),("2. Совместить по меткам",v.align_landmarks),("3. Уточнить совпадение (ICP)",v.align_icp)):
         button=v.button(v.row(merge),text,fn); v.merge_buttons.append(button)
-    v.merge_buttons[1].configure(style="Accent.TButton")
     row=v.row(merge); v.button(row,"Показать оба",v.show_all); v.button(row,"Сброс меток",v.cancel_landmarks)
     note(merge,variable=v.merge_text)
     note(merge,"Выбирайте разнесённые детали в общей части. Снимки должны иметь одинаковый масштаб. После сшивки сохраните проект для дальнейшего редактирования.")

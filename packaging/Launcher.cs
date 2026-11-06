@@ -7,8 +7,8 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Стереокамера — расстояние и карта")]
 [assembly: AssemblyProduct("StereoMapper")]
-[assembly: AssemblyVersion("0.16.0.0")]
-[assembly: AssemblyFileVersion("0.16.0.0")]
+[assembly: AssemblyVersion("0.16.1.0")]
+[assembly: AssemblyFileVersion("0.16.1.0")]
 
 internal static class Launcher
 {

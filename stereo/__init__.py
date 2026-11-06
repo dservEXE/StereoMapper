@@ -9,9 +9,11 @@ os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 import sys
 from pathlib import Path
 
-# Optional NVIDIA PyTorch from gpu_pack.py: must come before the bundled one on the import path.
-_gpu_runtime = Path(__file__).resolve().parent.parent / "gpu_runtime"
-if (_gpu_runtime / "torch" / "__init__.py").is_file():
+from .gpu_pack import activate_pending
+
+# An optional accelerator pack must come before the bundled PyTorch on the import path.
+_gpu_runtime = activate_pending(Path(__file__).resolve().parent.parent)
+if _gpu_runtime is not None:
     sys.path.insert(0, str(_gpu_runtime))
 
 import cv2

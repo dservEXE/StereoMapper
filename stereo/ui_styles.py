@@ -313,8 +313,8 @@ def _style_tabs(style, paint, c) -> None:
             return paint.tab(on, color, thickness, outline)
         style.element_create(
             name, "image", line(None, 0),
-            ("selected", "user1", line(mix(on, c.accent, .45), 1)),
-            ("selected", "user2", line(mix(on, c.accent, .8), 2)),
+            ("selected", "alternate", line(mix(on, c.accent, .45), 1)),
+            ("selected", "user3", line(mix(on, c.accent, .8), 2)),
             ("selected", "focus", line(c.accent, 3, c.accent)),
             ("selected", line(c.accent, 3)),
             ("active", line(c.border_strong, 2)),

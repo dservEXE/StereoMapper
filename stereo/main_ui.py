@@ -1,6 +1,7 @@
 """Task-oriented application layout; numerical processing stays in app/worker."""
 import tkinter as tk
 from tkinter import ttk
+from .accelerator_ui import AcceleratorPanel
 from .help_ui import help_icon
 from .maixsense import TOF_LABEL
 from .presets import PRESETS
@@ -182,6 +183,9 @@ def build(app):
     action(tools,"Глубина по фотографии…",app.open_photos)
     note(tools,"Оценка глубины одного изображения имеет условный масштаб.")
     action(tools,"3D с оценёнными поверхностями",lambda:app.send("view",True),"frame",key="smooth")
+    line(tools)
+    section(tools,"Ускорение на видеокарте",0)
+    app.accelerator_panel=AcceleratorPanel(tools,app)
     line(tools)
     section(tools,"Диагностика",0)
     action(tools,"Проверить рабочую дистанцию",lambda:app.send("distance_report"),"calibrated",key="range")

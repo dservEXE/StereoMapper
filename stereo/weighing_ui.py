@@ -13,10 +13,10 @@ import cv2
 import numpy as np
 
 from .body_measure import MIN_KEYPOINT_SCORE, MIN_SAMPLES, SKELETON
-from .gpu_pack import DOWNLOAD_SIZE_GB, gpu_pack_ready, install_gpu_pack, nvidia_present
+from .gpu_pack import PACKS, graphics_adapters, install_pack, installed_pack, pack_advice, pending_pack
 from .people_database import CLOTHING, PeopleDatabase, SEXES, export_csv, make_entry, summarize, summary_text
 from .people_detection import DOWNLOAD_SIZE_MB, download_models, models_ready
-from .ui import note
+from .ui import fit_wrap, note
 from .version import VERSION
 from .weighing import person_result
 
@@ -24,6 +24,8 @@ NO_VALUE = "—"
 OUTLINE_OPACITY = .35
 SHOWN_EXPERIMENTS = 30
 HISTORY_REFRESH_MS = 700
+# The real-data form beside the database table, and the text width inside it.
+FORM_WIDTH, FORM_WRAP = 290, 268
 PART_NAMES = (("torso", "туловище"), ("upper_arm", "плечо"), ("forearm", "предплечье"),
               ("thigh", "бедро"), ("shin", "голень"), ("head", "голова"))
 
@@ -130,13 +132,18 @@ class WeighingTab:
         ttk.Label(sidebar, textvariable=self.message, style="Muted.TLabel", wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(0, 6))
         ttk.Label(sidebar, textvariable=self.report, wraplength=280, justify="left").pack(anchor="w", fill="x")
         ttk.Separator(sidebar).pack(fill="x", pady=12)
-        self.build_entry_form(sidebar, action)
+        action(sidebar, "Ввести настоящие данные →", lambda: self.views.select(self.database_page))
         note(sidebar, "Вес — приблизительная оценка по объёму тела. Номера действуют только в этом сеансе; "
                       "лица не распознаются, снимки не сохраняются.")
+        self.gpu_advice = tk.StringVar()
+        ttk.Label(sidebar, textvariable=self.gpu_advice, style="Muted.TLabel", wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(6, 0))
         self.download_button = action(footer, f"Скачать модели ({DOWNLOAD_SIZE_MB} МБ)", self.start_download, primary=True)
         self.reset_button = action(footer, "Начать замеры заново", lambda: app.send("weighing_reset"), "calibrated")
         self.save_button = action(footer, "Сохранить результат", self.save, "calibrated")
-        self.gpu_button = action(footer, f"Ускорить на видеокарте ({DOWNLOAD_SIZE_GB} ГБ)", self.start_gpu_install)
+        self.gpu_button = action(footer, "Ускорить на этом компьютере", self.start_gpu_install)
+        self.gpu_button_place = self.gpu_button.pack_info()
+        self.gpu_button.pack_forget()
+        self.recommended_pack = None
         self.views = ttk.Notebook(view, style="Inner.TNotebook")
         self.views.pack(fill="both", expand=True)
         camera_page = ttk.Frame(self.views)
@@ -150,11 +157,9 @@ class WeighingTab:
         self.available = models_ready(app.directory)
         app.workflow.bind("<<NotebookTabChanged>>", self.tab_changed, add="+")
         self.show_download_state()
-        if gpu_pack_ready(app.directory):
-            self.gpu_button.pack_forget()
-        else:
-            # Asking the driver takes a moment, and only matters if the button may be pressed.
-            Thread(target=lambda: self.downloads.put(("nvidia", nvidia_present())), daemon=True).start()
+        present = pending_pack(app.directory) or installed_pack(app.directory)
+        # Asking Windows about the graphics cards takes a moment.
+        Thread(target=lambda: self.downloads.put(("advice", pack_advice(graphics_adapters(), present))), daemon=True).start()
 
     def build_metrics(self, parent) -> None:
         row = ttk.Frame(parent)
@@ -168,7 +173,7 @@ class WeighingTab:
         """Real height and weight for a measurement, to build the database."""
         ttk.Label(parent, text="Настоящие данные", style="Section.TLabel").pack(anchor="w")
         note(parent, "Камера сравнит свой замер с реальностью, и эти записи пойдут на улучшение расчёта. "
-                     "Записывайте человека только с его согласия; вместо имени подойдёт код.")
+                     "Записывайте человека только с его согласия; вместо имени подойдёт код.", width=FORM_WRAP)
         form = ttk.Frame(parent)
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
@@ -191,8 +196,9 @@ class WeighingTab:
             control.grid(row=row, column=1, sticky="ew", pady=3)
         ttk.Checkbutton(form, text="Вес взят с весов только что", variable=self.entry_scales).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 2))
         self.entry_feedback = tk.StringVar()
-        action(parent, "Добавить в базу", self.add_to_database, primary=True).pack_configure(pady=(6, 2))
-        ttk.Label(parent, textvariable=self.entry_feedback, wraplength=280, justify="left").pack(anchor="w", fill="x")
+        self.add_button = action(parent, "Добавить в базу", self.add_to_database, primary=True)
+        self.add_button.pack_configure(pady=(6, 2))
+        ttk.Label(parent, textvariable=self.entry_feedback, wraplength=FORM_WRAP, justify="left").pack(anchor="w", fill="x")
 
     def build_history_page(self, action) -> None:
         page = ttk.Frame(self.views, padding=8)
@@ -216,24 +222,34 @@ class WeighingTab:
 
     def build_database_page(self, action) -> None:
         page = ttk.Frame(self.views, padding=8)
+        self.database_page = page
         self.views.add(page, text="База людей")
+        form = ttk.Frame(page, padding=(14, 0, 4, 0), width=FORM_WIDTH)
+        form.pack(side="right", fill="y")
+        form.pack_propagate(False)
+        self.build_entry_form(form, action)
         self.database_summary = tk.StringVar()
-        ttk.Label(page, textvariable=self.database_summary, wraplength=900, justify="left").pack(anchor="w", fill="x", pady=(0, 8))
+        summary = ttk.Label(page, textvariable=self.database_summary, wraplength=FORM_WIDTH, justify="left")
+        summary.pack(anchor="w", fill="x", pady=(0, 8))
+        fit_wrap(page, summary, margin=FORM_WIDTH + 32)
         buttons = ttk.Frame(page)
         buttons.pack(side="bottom", fill="x", pady=(8, 0))
         ttk.Button(buttons, text="Удалить запись", style="Danger.TButton", command=self.delete_entry).pack(side="left")
         ttk.Button(buttons, text="Сохранить CSV", command=self.export_database).pack(side="right")
         table = ttk.Frame(page)
         table.pack(fill="both", expand=True)
-        columns = (("created", "Дата", 130), ("label", "Метка", 150), ("sex", "Пол", 80), ("real_height", "Рост, см", 80),
-                   ("camera_height", "Камера, см", 90), ("real_weight", "Вес, кг", 80), ("camera_weight", "Камера, кг", 90),
-                   ("error", "Ошибка, кг", 90), ("clothing", "Одежда", 100))
+        columns = (("created", "Дата", 114), ("label", "Метка", 74), ("sex", "Пол", 62), ("real_height", "Рост, см", 70),
+                   ("camera_height", "Камера, см", 86), ("real_weight", "Вес, кг", 62), ("camera_weight", "Камера, кг", 86),
+                   ("error", "Ошибка, кг", 86), ("clothing", "Одежда", 70))
         self.database_table = ttk.Treeview(table, columns=[column[0] for column in columns], show="headings", selectmode="browse")
         for name, title, width in columns:
             self.database_table.heading(name, text=title, anchor="w")
-            self.database_table.column(name, width=width, anchor="w", stretch=name == "label")
+            self.database_table.column(name, width=width, minwidth=width, anchor="w", stretch=name == "label")
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.database_table.yview)
-        self.database_table.configure(yscrollcommand=scroll.set)
+        # On a narrow window the columns keep their width and the table scrolls sideways.
+        sideways = ttk.Scrollbar(table, orient="horizontal", command=self.database_table.xview)
+        self.database_table.configure(yscrollcommand=scroll.set, xscrollcommand=sideways.set)
+        sideways.pack(side="bottom", fill="x")
         self.database_table.pack(side="left", fill="both", expand=True)
         scroll.pack(side="left", fill="y")
         self.refresh_database()
@@ -244,8 +260,8 @@ class WeighingTab:
         known = self.shown.known if self.shown is not None else {}
         for track_id, estimate in sorted(known.items()):
             if estimate.samples:
-                mass = f"{estimate.mass_kg:.0f} кг" if estimate.mass_kg else "без оценки"
-                sources[f"Сейчас · №{track_id} · {mass}"] = person_result(track_id, estimate)
+                # No mass in this name: it changes while real data is being typed.
+                sources[f"Сейчас · №{track_id}"] = person_result(track_id, estimate)
         for name, data in self.history_items:
             when = experiment_title(name, dict(people=[])).split("  ")[0]
             for person in data["people"]:
@@ -258,7 +274,12 @@ class WeighingTab:
             self.entry_source.set(next(iter(sources), ""))
 
     def add_to_database(self) -> None:
+        chosen = self.entry_source.get()
         self.refresh_sources()
+        if chosen and chosen not in self.sources:
+            # Silently using another measurement would put a wrong person into the database.
+            self.entry_feedback.set("Выбранного замера больше нет. Выберите замер снова.")
+            return
         worker = self.app.worker
         camera = getattr(getattr(worker, "config", None), "mode", "")
         try:
@@ -354,19 +375,27 @@ class WeighingTab:
             self.history_text.set("В этом эксперименте нет людей с измерениями.")
             return
         self.entry_source.set(match)
-        self.entry_feedback.set("Замер выбран. Введите настоящие рост и вес слева.")
+        self.entry_feedback.set("Замер выбран. Введите настоящие рост и вес.")
+        self.views.select(self.database_page)
 
     def start_gpu_install(self) -> None:
         if self.downloading:
             return
+        if pending_pack(self.app.directory) == self.recommended_pack:  # Chosen on the settings page meanwhile.
+            self.gpu_button.pack_forget()
+            self.gpu_advice.set("")
+            self.message.set("Ускорение установлено. Перезапустите программу, чтобы оно заработало.")
+            return
         self.downloading = True
         self.gpu_button.configure(state="disabled")
+        key = self.recommended_pack
+        self.gpu_advice.set("")
 
         def work():
             try:
-                install_gpu_pack(self.app.directory, lambda text: self.downloads.put(("status", text)))
+                install_pack(self.app.directory, key, lambda text: self.downloads.put(("status", text)))
                 self.downloads.put(("gpu_done", None))
-            except RuntimeError as error:
+            except Exception as error:  # noqa: BLE001 - the button must never stay blocked.
                 self.downloads.put(("error", str(error)))
         Thread(target=work, daemon=True, name="gpu-download").start()
 
@@ -375,6 +404,8 @@ class WeighingTab:
 
     def show_download_state(self) -> None:
         self.available = models_ready(self.app.directory)
+        # One main button at a time: the footer stays visible over the form while models are missing.
+        self.add_button.configure(style="Accent.TButton" if self.available else "TButton")
         if self.available:
             self.download_button.pack_forget()
         elif not self.downloading:
@@ -418,7 +449,7 @@ class WeighingTab:
             try:
                 download_models(self.app.directory, lambda text: self.downloads.put(("status", text)))
                 self.downloads.put(("done", None))
-            except RuntimeError as error:
+            except Exception as error:  # noqa: BLE001 - the button must never stay blocked.
                 self.downloads.put(("error", str(error)))
         Thread(target=work, daemon=True, name="model-download").start()
 
@@ -428,9 +459,12 @@ class WeighingTab:
                 kind, value = self.downloads.get_nowait()
                 if kind == "status":
                     self.message.set(value)
-                elif kind == "nvidia":
-                    if not value:
-                        self.gpu_button.pack_forget()
+                elif kind == "advice":
+                    self.recommended_pack = value.pack
+                    if value.pack:
+                        self.gpu_button.configure(text=f"Ускорить этот компьютер ({PACKS[value.pack].size_text})")
+                        self.gpu_button.pack(**self.gpu_button_place)
+                        self.gpu_advice.set(value.text)
                 elif kind == "gpu_done":
                     self.downloading = False
                     self.gpu_button.pack_forget()

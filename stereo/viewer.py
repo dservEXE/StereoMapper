@@ -19,6 +19,22 @@ FILE_TYPES = [("Облако или проект", "*.ply *.sqlite *.cloudproj")
               ("Архив карты", "*.sqlite"), ("Проект 3D", "*.cloudproj")]
 
 
+# Room one compass label needs, in pixels: wide enough for the longest name.
+COMPASS_LABEL_WIDTH, COMPASS_LABEL_HEIGHT = 56, 15
+
+
+def compass_label_places(ends) -> list:
+    """Where to write each axis name: beside its arrow tip, moved down only if it would cover another."""
+    places = [[float(x) + 5, float(y) - 9] for x, y in ends]
+    placed = []
+    for place in sorted(places, key=lambda item: item[1]):
+        for other in sorted(placed, key=lambda item: item[1]):
+            if abs(place[0] - other[0]) < COMPASS_LABEL_WIDTH and abs(place[1] - other[1]) < COMPASS_LABEL_HEIGHT:
+                place[1] = other[1] + COMPASS_LABEL_HEIGHT
+        placed.append(place)
+    return [tuple(place) for place in places]
+
+
 class CloudViewer:
     def __init__(self, parent, points, colors, units="metres", title="Редактор 3D-карты",
                  total_count=None, max_points=250000, archive_path=None, source_path=None):
@@ -701,10 +717,11 @@ class CloudViewer:
         self.canvas.delete("all"); self.canvas.create_image(0,0,anchor="nw",image=self.photo)
         # Compass follows the user-defined scene basis, not the raw file axes.
         basis=self.rotation@self.scene_frame.T; origin=np.array([65.,h-65.])
-        for vector,label,color in ((-basis[:,1],"Верх","#6dde8b"),(basis[:,0],"Право","#ff8585"),(basis[:,2],"Вперёд","#7cbbff")):
-            end=origin+vector[:2]*40
+        axes=((-basis[:,1],"Верх","#6dde8b"),(basis[:,0],"Право","#ff8585"),(basis[:,2],"Вперёд","#7cbbff"))
+        ends=[origin+vector[:2]*40 for vector,_,_ in axes]
+        for (_,label,color),end,place in zip(axes,ends,compass_label_places(ends)):
             self.canvas.create_line(*origin,*end,fill=color,width=2,arrow="last")
-            self.canvas.create_text(* (end+[5,-9]),text=label,fill=color,anchor="w")
+            self.canvas.create_text(*place,text=label,fill=color,anchor="w")
         self.canvas.create_text(w-12,12,anchor="ne",fill=ui.palette().image_muted,text="Ортографическая проекция" if self.projection.get()=="orthographic" else "Перспектива")
         if self.plane_points:
             xy,_,front=project_points(self.plane_points,w,h,**self.camera())

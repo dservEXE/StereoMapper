@@ -14,6 +14,7 @@ from .version import VERSION
 
 
 DEFAULT_DISTANCE_M = 3.
+MAX_MEASURE_FAILURES = 5
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,8 @@ class WeighingSession(Thread):
         self.reset_requested = False
         self.measured_at = {}
         self.outlines_seen = {}
+        # Numbers restart after a reset: a measurement still in progress must not reach the new person.
+        self.generation = 0
 
     def submit(self, frame, K, baseline=None) -> None:
         """Newest frame for analysis. A baseline in metres enables distance from both outlines."""
@@ -111,7 +114,9 @@ class WeighingSession(Thread):
         observations = detector.detect(frame.left)
         depths = [torso_depth(frame, observation) for observation in observations]
         views, waiting = [], []
-        for track, observation, index in self.tracker.update(frame.left, observations, depths, now):
+        matched = self.tracker.update(frame.left, observations, depths, now)
+        self.retire_forgotten()
+        for track, observation, index in matched:
             with self.lock:
                 estimate = self.bodies.setdefault(track.track_id, BodyAccumulator()).estimate()
                 outline = self.outlines_seen.get(track.track_id)
@@ -123,9 +128,18 @@ class WeighingSession(Thread):
         with self.lock:
             known = {track_id: body.estimate() for track_id, body in self.bodies.items()}
         message = f"В кадре людей: {len(people)}" if people else "Людей в кадре не видно"
-        if getattr(detector, "device", None):
-            message += " · видеокарта" if detector.device == "cuda" else " · процессор"
+        if getattr(detector, "device_label", None):
+            message += " · " + detector.device_label
         return WeighingState(people, known, fps, message, frame.left)
+
+    def retire_forgotten(self) -> None:
+        """A label that left the tracker never returns: keep its result and free its memory."""
+        with self.lock:
+            for track_id, body in self.bodies.items():
+                if track_id not in self.tracker.tracks and body.samples:
+                    body.retire()
+                    self.outlines_seen.pop(track_id, None)
+                    self.measured_at.pop(track_id, None)
 
     def request_outline(self, frame, K, baseline, waiting) -> None:
         """Hand the least recently measured person to the slower outline thread, if it is free."""
@@ -133,24 +147,32 @@ class WeighingSession(Thread):
             return
         track_id, observation = min(waiting, key=lambda item: self.measured_at.get(item[0], 0.))
         self.measured_at[track_id] = time.perf_counter()
-        self.outlines.put((frame, K, baseline, track_id, observation))
+        self.outlines.put((frame, K, baseline, track_id, observation, self.generation))
 
     def measure_loop(self, detector) -> None:
-        """Outlines take about a second each, so labels must not wait for them."""
+        """Outlines take a while, so labels must not wait for them."""
+        failures = 0
         while not self.stop_event.is_set():
             try:
-                frame, K, baseline, track_id, observation = self.outlines.get(timeout=.1)
+                frame, K, baseline, track_id, observation, generation = self.outlines.get(timeout=.1)
             except Empty:
                 continue
             try:
                 mask = detector.outline(frame.left, observation)
                 depth = self.outline_distance(detector, frame, K, baseline, mask, observation)
                 sample = measure_person(frame.points, frame.valid, K, observation, mask, depth)
+                failures = 0
             except Exception as error:
-                self.fail(f"Ошибка измерения: {error}")
-                return
+                # One bad frame costs one measurement; repeating failures stop the session visibly.
+                failures += 1
+                if failures >= MAX_MEASURE_FAILURES:
+                    self.fail(f"Ошибка измерения: {error}")
+                    self.stop_event.set()
+                    return
+                self.status(f"Замер пропущен: {error}")
+                continue
             with self.lock:
-                body = self.bodies.get(track_id)
+                body = self.bodies.get(track_id) if generation == self.generation else None
                 if sample is not None and body is not None:
                     body.add(sample)
                     self.outlines_seen[track_id] = mask
@@ -176,6 +198,11 @@ class WeighingSession(Thread):
                 with self.lock:
                     self.tracker, self.bodies, self.measured_at = PersonTracker(), {}, {}
                     self.outlines_seen = {}
+                    self.generation += 1
+                try:
+                    self.outlines.get_nowait()
+                except Empty:
+                    pass
             try:
                 state = self.analyse(detector, frame, K, fps, baseline)
             except Exception as error:
@@ -193,7 +220,8 @@ class WeighingSession(Thread):
     def fail(self, message: str) -> None:
         self.error = message
         with self.lock:
-            self.state = WeighingState((), {}, 0., message)
+            known = {track_id: body.estimate() for track_id, body in self.bodies.items()}
+            self.state = WeighingState((), known, 0., message)
         self.status(message)
 
     def snapshot(self) -> WeighingState:

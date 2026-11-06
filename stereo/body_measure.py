@@ -361,11 +361,18 @@ def percentile(values, q):
 class BodyAccumulator:
     """Combine one person's frames: front and side views need separating as they turn."""
     samples: list = field(default_factory=list)
+    cached: object = None
 
     def add(self, sample: BodySample) -> None:
         self.samples.append(sample)
+        self.cached = None
         if len(self.samples) > MAX_SAMPLES:
             del self.samples[0]
+
+    def retire(self) -> None:
+        """Keep the result of a person who has gone, and free what produced it."""
+        self.estimate()
+        self.samples = []
 
     def steady(self) -> list:
         """All frames at one scale for this body, as if depth had been free of noise."""
@@ -401,6 +408,12 @@ class BodyAccumulator:
         return percentile(values, 80)
 
     def estimate(self) -> WeightEstimate:
+        """Recomputed only after a new sample: it is asked for every frame, for every person."""
+        if self.cached is None:
+            self.cached = self.compute_estimate()
+        return self.cached
+
+    def compute_estimate(self) -> WeightEstimate:
         count = len(self.samples)
         samples = self.steady()
         views = self.views(samples)

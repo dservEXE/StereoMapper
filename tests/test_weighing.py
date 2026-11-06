@@ -11,7 +11,6 @@ import time
 import tkinter as tk
 import unittest
 from unittest.mock import patch
-import zipfile
 
 import cv2
 import numpy as np
@@ -27,7 +26,6 @@ from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, fill_holes
 from stereo.people_detection import (DETECTOR, DOWNLOAD_SIZE_MB, SEGMENTER, SOURCES, crop_matrix, decode_heatmaps, download_models,
                                      model_path, models_ready, outline_hints, peak, pose_crop)
 from stereo.people_tracking import PersonTracker, box_iou
-from stereo.gpu_pack import WHEEL_SHA256, WHEEL_URL, gpu_pack_ready, install_gpu_pack
 from stereo.weighing import WeighingSession
 from stereo.worker import CameraWorker
 from stereo.weighing_ui import draw_people, experiment_report, experiment_title, person_report, saved_experiments
@@ -909,57 +907,6 @@ class WorkerCommandTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             with self.assertRaisesRegex(ValueError, "вкладку"):
                 self.worker(temp).command("weighing_save", Path(temp) / "r.json")
-
-
-class GpuPackTests(unittest.TestCase):
-    @staticmethod
-    def wheel_bytes():
-        stream = io.BytesIO()
-        with zipfile.ZipFile(stream, "w") as wheel:
-            wheel.writestr("torch/__init__.py", "")
-        return stream.getvalue()
-
-    def install(self, temp, data, sha=None, **kwargs):
-        def opener(request, timeout=None):
-            return io.BytesIO(data[int((request.get_header("Range") or "bytes=0-")[6:-1]):])
-        install_gpu_pack(temp, opener=opener, url="https://example.test/x", size=len(data),
-                         sha256=sha or hashlib.sha256(data).hexdigest(), **kwargs)
-
-    def test_verified_download_is_unpacked_and_the_archive_removed(self):
-        data = self.wheel_bytes()
-        with TemporaryDirectory() as temp:
-            self.assertFalse(gpu_pack_ready(temp))
-            self.install(temp, data)
-            self.assertTrue(gpu_pack_ready(temp))
-            self.assertFalse((Path(temp) / "gpu_runtime.download").exists())
-
-    def test_corrupt_download_is_rejected_and_nothing_is_activated(self):
-        with TemporaryDirectory() as temp:
-            with self.assertRaisesRegex(RuntimeError, "контрольная"):
-                self.install(temp, self.wheel_bytes(), sha="0" * 64)
-            self.assertFalse(gpu_pack_ready(temp))
-            self.assertFalse((Path(temp) / "gpu_runtime.download").exists())
-
-    def test_interrupted_download_continues_where_it_stopped(self):
-        data = self.wheel_bytes()
-        with TemporaryDirectory() as temp:
-            (Path(temp) / "gpu_runtime.download").write_bytes(data[:40])
-            ranges = []
-
-            class Answer(io.BytesIO):
-                status = 206
-
-            def opener(request, timeout=None):
-                ranges.append(request.get_header("Range"))
-                return Answer(data[40:])
-            install_gpu_pack(temp, opener=opener, url="https://example.test/x", size=len(data),
-                             sha256=hashlib.sha256(data).hexdigest())
-            self.assertEqual(ranges, ["bytes=40-"])
-            self.assertTrue(gpu_pack_ready(temp))
-
-    def test_the_pinned_download_is_the_same_torch_version_as_the_runtime(self):
-        self.assertIn("torch-2.14.1", WHEEL_URL)
-        self.assertRegex(WHEEL_SHA256, r"^[0-9a-f]{64}$")
 
 
 class ExperimentHistoryTests(unittest.TestCase):

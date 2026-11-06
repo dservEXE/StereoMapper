@@ -74,18 +74,26 @@ MIN_WRAP, WRAP_STEP = 160, 4
 # How far a danger button moves towards its text colour; its text stays above 4.5:1 on both.
 DANGER_HOVER, DANGER_PRESSED = .08, .15
 
+# Below this length the rounded ends of a progress indicator have no room and it reads as a stray tick.
+PROGRESS_MIN_PIXELS = 8
+
 # Spacing rhythm, in pixels.
 SPACE_XS, SPACE_S, SPACE_M, SPACE_L = 4, 8, 12, 16
 # Keeps rectangular children of a card clear of its rounded corners.
 CARD_INSET = 3
 
 # Transition timings: about 120-180 ms in total, only ever started by an event.
-HOVER_STEP_MS, PRESS_STEP_MS, FADE_STEP_MS = 45, 70, 50
-FLAGS = ("user1", "user2", "user3")
+HOVER_STEP_MS, PRESS_STEP_MS, FADE_STEP_MS = 45, 70, 60
+FLAGS = ("user1", "user2", "user3", "alternate")
 HOVER_IN = (("user1",), ("user2",), ("user1", "user2"))
 HOVER_OUT = tuple(reversed(HOVER_IN))
 PRESS = (("user3",),)
 FADE_IN = (("user1",), ("user2",))
+# A notebook marks its first tab user1 and its last tab user2, so its frames use the two flags Tk 8.6 leaves free.
+TAB_FADE_IN = (("alternate",), ("user3",))
+
+# Win32 values for repaint_only_what_changed: GetAncestor, GetClassLongPtr and the class styles.
+GA_ROOT, GCL_STYLE, CS_RESIZE_REDRAW = 2, -26, 0x0001 | 0x0002
 
 
 def palette() -> Palette:
@@ -213,7 +221,7 @@ class Animator:
 
     def _notebook(self, event) -> None:
         if not isinstance(event.widget, str):
-            self.play(event.widget, FADE_IN, FADE_STEP_MS)
+            self.play(event.widget, TAB_FADE_IN, FADE_STEP_MS)
 
 
 def animator(widget):
@@ -280,12 +288,44 @@ def title_bar(window) -> None:
         _dark_title_bar(window)
 
 
+def repaint_only_what_changed(window) -> None:
+    """Stop Windows repainting a whole subtree whenever one of its ancestors changes size.
+
+    Tk registers its window classes with CS_HREDRAW and CS_VREDRAW, so every resized level of
+    nesting repainted all the widgets below it: about seven rounds per widget on the settings
+    page. A Tk widget redraws itself when its own size changes, so nothing is left stale. The
+    flags belong to the class, which is why this also covers windows opened later.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32")
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetClassLongPtrW.restype = ctypes.c_size_t
+        user32.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_size_t]
+        user32.SetClassLongPtrW.restype = ctypes.c_size_t
+        inner = window.winfo_id()
+        for handle in (inner, user32.GetAncestor(inner, GA_ROOT)):
+            style = user32.GetClassLongPtrW(handle, GCL_STYLE)
+            if style & CS_RESIZE_REDRAW:
+                user32.SetClassLongPtrW(handle, GCL_STYLE, style & ~CS_RESIZE_REDRAW)
+    except (AttributeError, OSError, ValueError, tk.TclError):
+        pass
+
+
+def _window_mapped(window) -> None:
+    title_bar(window)
+    repaint_only_what_changed(window)
+
+
 def style_window(window) -> None:
     """Prepare any top-level window: the theme, its background and a matching title bar."""
     apply_theme(window)
     window.configure(background=palette().surface)
     # The native frame exists only once the window is on screen.
-    window.bind("<Map>", lambda event: title_bar(window) if event.widget is window else None, add="+")
+    window.bind("<Map>", lambda event: _window_mapped(window) if event.widget is window else None, add="+")
 
 
 def note(parent, text=None, variable=None, width=280, **kwargs):
@@ -294,6 +334,15 @@ def note(parent, text=None, variable=None, width=280, **kwargs):
                       wraplength=width, justify="left", **kwargs)
     label.pack(fill="x", pady=(SPACE_XS, SPACE_S))
     return label
+
+
+def show_progress(bar, value) -> None:
+    """Set a determinate bar. A small non-zero value is drawn as a short pill rather than a tick."""
+    width = bar.winfo_width()
+    if value > 0 and width > 1:
+        maximum = float(bar.cget("maximum"))
+        value = max(value, min(maximum, maximum * PROGRESS_MIN_PIXELS / width))
+    bar.configure(value=value)
 
 
 def fit_wrap(frame, *labels, margin=0) -> None:

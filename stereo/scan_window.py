@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk,messagebox
 import cv2
 import numpy as np
+from . import ui
 from .help_ui import help_icon
 
 
@@ -80,7 +81,7 @@ class ObjectScanWindow:
         self.directory=None
         self.coverage.configure(value=0); self.coverage_text.set("Покрытие первого ракурса: 0%")
         self.set_active(True)
-        self.view_button.configure(state='disabled')
+        self.view_button.configure(state='disabled',style="TButton");self.start_button.configure(style="Accent.TButton")
         self.message.set("Подготовка. Первые точки появятся после трёх согласованных наблюдений…")
         self.app.send('scan_start',options)
 
@@ -100,7 +101,7 @@ class ObjectScanWindow:
                 cv2.rectangle(image,(int(x0*w),int(y0*h)),(int(x1*w),int(y1*h)),(0,210,255),2)
             self.right.set(image)
             self.summary.set(f"{value['points']:,} точек · {value['seconds']:.0f} сек · добавлено кадров: {value['integrated']}")
-            self.coverage.configure(value=value['coverage']*100)
+            ui.show_progress(self.coverage,value['coverage']*100)
             self.coverage_text.set(f"Покрытие первого ракурса: {value['coverage']:.0%}")
             self.message.set(value['tracking'])
         elif kind=='scan_finished':
@@ -108,7 +109,9 @@ class ObjectScanWindow:
             self.view_button.configure(state='normal' if value.get('points',0)>0 else 'disabled')
             self.phase.set("Скан сохранён" if value.get('points',0)>0 else "Скан завершён без точек")
             self.summary.set(f"{value.get('points',0):,} точек. "+("Откройте результат в 3D, чтобы убрать фон и сохранить нужную область." if value.get('points',0)>0 else "Проверьте глубину и освещение перед повторной съёмкой."))
-            self.view_button.configure(style="Accent.TButton")
+            # One main button: opening the result takes over from starting a scan.
+            if value.get('points',0)>0:
+                self.view_button.configure(style="Accent.TButton");self.start_button.configure(style="TButton")
             self.message.set(value['reason'])
             self.left.title_label.configure(text='Последняя измеренная глубина')
 

@@ -40,6 +40,7 @@ class CameraWorker(Thread):
         self.root, self.config = Path(root), config
         self.is_tof = config.mode == TOF_MODE
         self.signal_filter = signal_filter
+        self.weighing_stopping = None
         self.weighing = None
         if self.is_tof:
             max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
@@ -179,6 +180,12 @@ class CameraWorker(Thread):
             raise ValueError("Для взвешивания сначала нужна калибровка.")
         if self.scan:
             raise ValueError("Завершите объёмный снимок перед взвешиванием.")
+        stopping, self.weighing_stopping = self.weighing_stopping, None
+        if self.weighing is None and stopping is not None and stopping.is_alive():
+            # Still loading its models, which cannot be interrupted: take it back, rather than
+            # start a second session and a second copy of the models.
+            stopping.stop_event.clear()
+            self.weighing = stopping
         if self.weighing is None:
             from .people_detection import PersonDetector
             self.weighing = WeighingSession(lambda status: PersonDetector(self.root, status),
@@ -191,7 +198,8 @@ class CameraWorker(Thread):
     def stop_weighing(self):
         if self.weighing is not None:
             self.weighing.stop_event.set()
-            self.weighing.join(timeout=5)
+            self.weighing.join(timeout=1)
+            self.weighing_stopping = self.weighing if self.weighing.is_alive() else None
             self.weighing = None
 
     def command(self, name, value=None):

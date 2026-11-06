@@ -165,6 +165,8 @@ class AppUXTests(unittest.TestCase):
             scan.update('scan_finished',dict(directory=str(Path(self.temp.name)/'result'),points=1500,coverage=.6,reason='Готово'))
             self.assertEqual(scan.phase.get(),'Скан сохранён'); self.assertTrue(self.enabled(scan.view_button))
             self.assertIn('1,500',scan.summary.get())
+            self.assertEqual(str(scan.view_button.cget('style')),'Accent.TButton')
+            self.assertEqual(str(scan.start_button.cget('style')),'TButton','one main button at a time')
         finally:
             scan.active=False; scan.window.destroy()
             self.assertIsNone(scan.poll_id)
