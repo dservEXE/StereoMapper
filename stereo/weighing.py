@@ -21,6 +21,8 @@ class PersonView:
     keypoint_scores: np.ndarray
     depth: float | None
     estimate: object
+    # The body pixels counted at the latest measurement, for checking what went into the sum.
+    outline: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class WeighingSession(Thread):
         self.error = None
         self.reset_requested = False
         self.measured_at = {}
+        self.outlines_seen = {}
 
     def submit(self, frame, K) -> None:
         try:
@@ -80,8 +83,9 @@ class WeighingSession(Thread):
         for track, observation, index in self.tracker.update(frame.left, observations, depths, now):
             with self.lock:
                 estimate = self.bodies.setdefault(track.track_id, BodyAccumulator()).estimate()
+                outline = self.outlines_seen.get(track.track_id)
             views.append(PersonView(track.track_id, track.color, observation.box, observation.keypoints,
-                                    observation.keypoint_scores, depths[index], estimate))
+                                    observation.keypoint_scores, depths[index], estimate, outline))
             waiting.append((track.track_id, observation))
         self.request_outline(frame, K, waiting)
         people = tuple(sorted(views, key=lambda view: view.track_id))
@@ -115,6 +119,7 @@ class WeighingSession(Thread):
                 body = self.bodies.get(track_id)
                 if sample is not None and body is not None:
                     body.add(sample)
+                    self.outlines_seen[track_id] = mask
 
     def run(self) -> None:
         try:
@@ -136,6 +141,7 @@ class WeighingSession(Thread):
                 self.reset_requested = False
                 with self.lock:
                     self.tracker, self.bodies, self.measured_at = PersonTracker(), {}, {}
+                    self.outlines_seen = {}
             try:
                 state = self.analyse(detector, frame, K, fps)
             except Exception as error:
@@ -166,7 +172,8 @@ class WeighingSession(Thread):
         people = [dict(label=track_id, samples=e.samples, height_m=e.height_m, widths_m=e.widths_m,
                        side_widths_m=e.side_widths_m, lengths_m=e.lengths_m, volume_l=e.volume_l,
                        mass_kg=e.mass_kg, mass_low_kg=e.mass_low_kg, mass_high_kg=e.mass_high_kg,
-                       side_observed=e.observed_side, views=e.view_coverage)
+                       side_observed=e.observed_side, views=e.view_coverage,
+                       slices_front_m=e.slices_front_m, slices_side_m=e.slices_side_m)
                   for track_id, e in sorted(state.known.items())]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(dict(units="metres, litres, kilograms", validated_against_scales=False,

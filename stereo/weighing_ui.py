@@ -6,11 +6,13 @@ import tkinter as tk
 from tkinter import ttk
 
 import cv2
+import numpy as np
 
 from .body_measure import MIN_KEYPOINT_SCORE, MIN_SAMPLES, SKELETON
 from .people_detection import DOWNLOAD_SIZE_MB, download_models, models_ready
 from .ui import note
 
+OUTLINE_OPACITY = .35
 PART_NAMES = (("torso", "туловище"), ("upper_arm", "плечо"), ("forearm", "предплечье"),
               ("thigh", "бедро"), ("shin", "голень"), ("head", "голова"))
 
@@ -19,6 +21,10 @@ def draw_people(image, state):
     """Overlay labels and joints. Text is Latin because OpenCV fonts have no Cyrillic."""
     canvas = image.copy()
     for person in state.people:
+        # What the volume is actually computed from; it trails the picture by a moment.
+        if person.outline is not None and person.outline.shape == canvas.shape[:2]:
+            tint = np.array(person.color, np.float32)
+            canvas[person.outline] = (canvas[person.outline] * (1 - OUTLINE_OPACITY) + tint * OUTLINE_OPACITY).astype(np.uint8)
         x0, y0, x1, y1 = (int(value) for value in person.box)
         cv2.rectangle(canvas, (x0, y0), (x1, y1), person.color, 2)
         for a, b in SKELETON:

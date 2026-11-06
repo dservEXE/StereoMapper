@@ -1,9 +1,10 @@
 """Measure a person from an outline, metric depth and joint positions, independent of the camera.
 
-The outline gives the shape and depth gives the scale. A body part is modelled as an elliptic
-cylinder, so its front and side widths give its volume, and volume gives mass. Turning on the
-spot is what provides the side widths. The result is an estimate that has not been validated
-against scales; WeightEstimate carries how much of it was observed rather than assumed.
+The outline gives the shape and depth gives the scale. The body from shoulders to ankles is cut
+into height slices, each an ellipse from its front and side widths, so that a bust, belly, pelvis
+and buttocks count at their own height. Arms and head are simple shapes. Turning on the spot
+provides the side widths. The result is an estimate that has not been validated against scales;
+WeightEstimate carries how much of it was observed rather than assumed.
 """
 from dataclasses import dataclass, field
 import math
@@ -41,8 +42,19 @@ BODY_DENSITY_KG_M3 = 1020.
 # Hands and feet are about 4% of body mass (Winter, Biomechanics) and are not measured here.
 HANDS_FEET_FACTOR = 1.04
 # Side width over front width, used only when turning has not shown the side.
-ASSUMED_DEPTH_RATIO = {"torso": .62, "head": .85, "upper_arm": 1., "forearm": 1., "thigh": 1., "shin": 1.}
-LIMB_COUNT = {"torso": 1, "head": 1, "upper_arm": 2, "forearm": 2, "thigh": 2, "shin": 2}
+ASSUMED_DEPTH_RATIO = {"head": .85, "upper_arm": 1., "forearm": 1.}
+LIMB_COUNT = {"head": 1, "upper_arm": 2, "forearm": 2}
+# Reported as sizes only; their volume comes from the slices.
+REPORTED_PARTS = ("torso", "thigh", "shin", *ASSUMED_DEPTH_RATIO)
+
+SLICES = 32
+# Slices reach this far to each side, in torso lengths: past the body, short of a raised hand.
+SLICE_REACH = .75
+MIN_RUN_PX = 2
+SHOULDER_SLICES = 4
+MAX_SHOULDER_RATIO = 1.35
+# Side width over front width, for slices when turning has not shown the side.
+ASSUMED_SLICE_RATIO, ASSUMED_LEG_RATIO = .62, 1.
 
 MIN_SAMPLES = 15
 MIN_BIN_SAMPLES = 5
@@ -66,6 +78,11 @@ class BodySample(NamedTuple):
     shoulder_span: float
     widths: dict
     lengths: dict
+    # Width of each slice from shoulders to ankles, NaN where an arm hides it, and whether
+    # that slice shows two separate legs. Empty if the ankles are not visible.
+    slice_widths: tuple = ()
+    slice_split: tuple = ()
+    slice_length: float | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +99,9 @@ class WeightEstimate:
     observed_side: bool
     view_coverage: dict
     message: str
+    # Widths from shoulders to ankles, for checking where the volume comes from.
+    slices_front_m: tuple = ()
+    slices_side_m: tuple = ()
 
 
 def run_length(mask, x, y, dx, dy, limit_px) -> float:
@@ -101,12 +121,51 @@ def run_length(mask, x, y, dx, dy, limit_px) -> float:
     return reached
 
 
+def body_slices(mask, neck, ankle, reach_px, scale) -> tuple:
+    """Each slice's width across the body and whether it shows two legs, from neck to ankles.
+
+    A slice the outline fills to both ends of its reach is an outstretched arm, not body.
+    """
+    neck, ankle = np.asarray(neck, float), np.asarray(ankle, float)
+    axis = ankle - neck
+    length = float(np.linalg.norm(axis))
+    if length < 8:
+        return (), ()
+    ux, uy = axis / length
+    offsets = np.arange(-int(reach_px), int(reach_px) + 1)
+    height, width = mask.shape
+    widths, split = [], []
+    for index in range(SLICES):
+        cx, cy = neck + axis * (index + .5) / SLICES
+        xs = np.clip(np.rint(cx - uy * offsets).astype(int), 0, width - 1)
+        ys = np.clip(np.rint(cy + ux * offsets).astype(int), 0, height - 1)
+        line = mask[ys, xs]
+        if len(line) and line[0] and line[-1]:
+            widths.append(math.nan)
+            split.append(False)
+            continue
+        changes = np.flatnonzero(np.diff(np.concatenate(((0,), line.astype(np.int8), (0,)))))
+        runs = changes[1::2] - changes[::2]
+        widths.append(float(runs[runs >= MIN_RUN_PX].sum()) * scale)
+        split.append(int((runs >= MIN_RUN_PX).sum()) >= 2)
+    return tuple(widths), tuple(split)
+
+
+def span_width(mask, start, end, scale) -> float | None:
+    """Median full width across a part, for the torso: its bones are not at its centre from the side."""
+    return _across(mask, start, end, scale, lambda first, second: first + second + 1)
+
+
 def part_width(mask, start, end, scale) -> float | None:
-    """Median width across the middle of a body part, in metres.
+    """Median width across a limb, in metres.
 
     Twice the shorter side from the bone: legs held together or an arm against the
     body would otherwise count as one wide part.
     """
+    return _across(mask, start, end, scale, lambda first, second: 2 * min(first, second) + 1)
+
+
+def _across(mask, start, end, scale, combine) -> float | None:
     start, end = np.asarray(start, float), np.asarray(end, float)
     axis = end - start
     length = float(np.linalg.norm(axis))
@@ -119,7 +178,7 @@ def part_width(mask, start, end, scale) -> float | None:
         x, y = start + axis * t
         px, py = int(round(x)), int(round(y))
         if 0 <= py < mask.shape[0] and 0 <= px < mask.shape[1] and mask[py, px]:
-            widths.append(2 * min(run_length(mask, x, y, -uy, ux, limit), run_length(mask, x, y, uy, -ux, limit)) + 1)
+            widths.append(combine(run_length(mask, x, y, -uy, ux, limit), run_length(mask, x, y, uy, -ux, limit)))
     return float(np.median(widths)) * scale if len(widths) >= 3 else None
 
 
@@ -164,7 +223,7 @@ def measure_person(points, valid, K, observation, mask) -> BodySample | None:
     focal = float(K[0, 0] + K[1, 1]) / 2
     scale = body_depth / focal
     widths, lengths = {}, {}
-    width = part_width(mask, neck, pelvis, scale)
+    width = span_width(mask, neck, pelvis, scale)
     if width is not None:
         widths["torso"] = width
     lengths["torso"] = torso_px * scale
@@ -189,7 +248,13 @@ def measure_person(points, valid, K, observation, mask) -> BodySample | None:
             ankle = ray_point(*np.mean(ankles, axis=0), body_depth, K)
             height = float(np.linalg.norm(ray_point(*top, body_depth, K) - ankle)) / (1 - ANKLE_HEIGHT_FRACTION)
     shoulder_span = float(np.linalg.norm(kp[L_SHOULDER] - kp[R_SHOULDER])) * scale
-    return BodySample(body_depth, height, shoulder_span, widths, lengths)
+    slices, split, slice_length = (), (), None
+    visible_ankles = [kp[i] for i in (L_ANKLE, R_ANKLE) if seen[i]]
+    if visible_ankles:
+        ankle = np.mean(visible_ankles, axis=0)
+        slices, split = body_slices(mask, neck, ankle, torso_px * SLICE_REACH, scale)
+        slice_length = float(np.linalg.norm(ankle - neck)) * scale
+    return BodySample(body_depth, height, shoulder_span, widths, lengths, slices, split, slice_length)
 
 
 def rescaled(sample: BodySample, depth: float) -> BodySample:
@@ -198,7 +263,38 @@ def rescaled(sample: BodySample, depth: float) -> BodySample:
     return BodySample(depth, sample.height * ratio if sample.height is not None else None,
                       sample.shoulder_span * ratio,
                       {key: value * ratio for key, value in sample.widths.items()},
-                      {key: value * ratio for key, value in sample.lengths.items()})
+                      {key: value * ratio for key, value in sample.lengths.items()},
+                      tuple(value * ratio for value in sample.slice_widths), sample.slice_split,
+                      sample.slice_length * ratio if sample.slice_length is not None else None)
+
+
+def slice_profile(samples) -> np.ndarray | None:
+    """Typical width of each slice over these frames, with gaps from arms filled by neighbours."""
+    rows = [sample.slice_widths for sample in samples if sample.slice_widths]
+    if len(rows) < MIN_BIN_SAMPLES:
+        return None
+    stacked = np.array(rows, float)
+    usable = np.isfinite(stacked).sum(axis=0) >= max(2, len(rows) // 4)
+    if usable.sum() < SLICES // 2:
+        return None
+    profile = np.full(SLICES, math.nan)
+    profile[usable] = [float(np.median(column[np.isfinite(column)])) for column in stacked.T[usable]]
+    # Arms held slightly down join the shoulders' slices without reaching the slice ends.
+    chest = profile[SHOULDER_SLICES:SHOULDER_SLICES * 3]
+    if np.isfinite(chest).any():
+        limit = float(np.nanmedian(chest)) * MAX_SHOULDER_RATIO
+        shoulders = np.zeros(SLICES, bool)
+        shoulders[:SHOULDER_SLICES] = True
+        usable = usable & ~(shoulders & (np.nan_to_num(profile) > limit))
+    positions = np.arange(SLICES)
+    return np.interp(positions, positions[usable], profile[usable])
+
+
+def slices_volume(front, side, split, length) -> float:
+    """Sum of elliptic slices. Where legs are apart each is half the front width and the full side."""
+    step = length / SLICES
+    area = np.where(split, 2 * math.pi / 4 * (front / 2) * side, math.pi / 4 * front * side)
+    return float(area.sum() * step)
 
 
 def percentile(values, q):
@@ -244,7 +340,7 @@ class BodyAccumulator:
             return WeightEstimate(count, height, {}, {}, {}, None, None, None, None, False, coverage,
                                   f"Идёт сбор: {count} из {MIN_SAMPLES}")
         widths, side_widths, lengths = {}, {}, {}
-        for part in ASSUMED_DEPTH_RATIO:
+        for part in REPORTED_PARTS:
             front_values = self.part_values(part, front)
             values = front_values if len(front_values) >= MIN_BIN_SAMPLES else self.part_values(part, self.samples)
             width = percentile(values, 50)
@@ -255,24 +351,35 @@ class BodyAccumulator:
             side_values = self.part_values(part, side)
             if len(side_values) >= MIN_BIN_SAMPLES:
                 side_widths[part] = percentile(side_values, 50)
-        needed = {"torso", "head", "thigh", "shin"}
-        if not needed <= set(widths):
-            missing = "ноги" if not {"thigh", "shin"} <= set(widths) else "туловище и голову"
+        front_slices = slice_profile(front) if len(front) >= MIN_BIN_SAMPLES else None
+        front_slices = front_slices if front_slices is not None else slice_profile(self.samples)
+        if not {"torso", "head", "thigh", "shin"} <= set(widths) or front_slices is None:
+            missing = "ноги" if not {"thigh", "shin"} <= set(widths) or front_slices is None else "туловище и голову"
             return WeightEstimate(count, height, widths, side_widths, lengths, None, None, None, None, False,
                                   coverage, f"Не видно: {missing}. Нужен человек в кадре целиком.")
-        observed_side = "torso" in side_widths
-        volume = 0.
-        for part, width in widths.items():
-            depth = side_widths.get(part, width * ASSUMED_DEPTH_RATIO[part])
-            area = math.pi / 4 * width * depth
-            volume += area * lengths[part] * (2 / 3 if part == "head" else 1) * LIMB_COUNT[part]
+        lengths_seen = [sample.slice_length for sample in self.samples if sample.slice_length]
+        split_rows = [sample.slice_split for sample in (front or self.samples) if sample.slice_split]
+        split = np.mean(np.array(split_rows, float), axis=0) >= .5
+        side_slices = slice_profile(side) if len(side) >= MIN_BIN_SAMPLES else None
+        observed_side = side_slices is not None
+        if side_slices is None:
+            side_slices = front_slices * np.where(split, ASSUMED_LEG_RATIO / 2, ASSUMED_SLICE_RATIO)
+        # Legs seen from the side overlap, so a slice's side width belongs to one leg at most.
+        volume = slices_volume(front_slices, side_slices, split, percentile(lengths_seen, 80))
+        for part in ASSUMED_DEPTH_RATIO:
+            if part in widths:
+                depth = side_widths.get(part, widths[part] * ASSUMED_DEPTH_RATIO[part])
+                area = math.pi / 4 * widths[part] * depth
+                volume += area * lengths[part] * (2 / 3 if part == "head" else 1) * LIMB_COUNT[part]
         mass = volume * BODY_DENSITY_KG_M3 * HANDS_FEET_FACTOR
         spread = self.relative_spread(front or self.samples)
         margin = max(MIN_RELATIVE_RANGE, spread) * (1 if observed_side else 1.5)
         message = ("Оценка готова; бок и перед измерены." if observed_side else
                    "Оценка предварительная: бок не измерен. Медленно повернитесь на месте.")
         return WeightEstimate(count, height, widths, side_widths, lengths, volume * 1000, mass,
-                              mass * (1 - margin), mass * (1 + margin), observed_side, coverage, message)
+                              mass * (1 - margin), mass * (1 + margin), observed_side, coverage, message,
+                              tuple(float(value) for value in front_slices),
+                              tuple(float(value) for value in side_slices))
 
     def relative_spread(self, selected) -> float:
         values = self.part_values("torso", selected)

@@ -18,8 +18,8 @@ from stereo.app import StereoApp
 from stereo.camera import CameraConfig
 from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, HANDS_FEET_FACTOR, KEYPOINT_COUNT,
                                  L_ANKLE, L_ELBOW, L_HIP, L_KNEE, L_SHOULDER, L_WRIST, MIN_SAMPLES, PersonObservation,
-                                 R_ANKLE, R_ELBOW, R_HIP, R_KNEE, R_SHOULDER, R_WRIST, measure_person, outline_depth, part_width,
-                                 rescaled)
+                                 R_ANKLE, R_ELBOW, R_HIP, R_KNEE, R_SHOULDER, R_WRIST, SLICES, body_slices, measure_person,
+                                 outline_depth, part_width, rescaled, slice_profile, slices_volume, span_width)
 from stereo.people_detection import (DETECTOR, DOWNLOAD_SIZE_MB, SEGMENTER, SOURCES, crop_matrix, decode_heatmaps, download_models,
                                      model_path, models_ready, peak, pose_crop)
 from stereo.people_tracking import PersonTracker, box_iou
@@ -168,6 +168,13 @@ class MeasureTests(unittest.TestCase):
         self.assertAlmostEqual(outline_depth(z, np.ones(z.shape, bool), mask), 2.7, delta=.05)
         self.assertGreater(float(np.median(z)), 2.75)
 
+    def test_torso_seen_from_the_side_counts_bust_and_buttocks_off_the_bone_line(self):
+        # The line from shoulder to hip runs near the back from the side: 5 px one way, 35 the other.
+        mask = np.zeros((200, 200), bool)
+        mask[:, 95:136] = True
+        self.assertAlmostEqual(span_width(mask, (100., 20.), (100., 180.), 1.), 41., delta=2)
+        self.assertLess(part_width(mask, (100., 20.), (100., 180.), 1.), 15.)
+
     def test_too_little_depth_on_the_body_gives_no_distance(self):
         z = np.full((50, 50), 2., np.float32)
         self.assertIsNone(outline_depth(z, np.zeros(z.shape, bool), np.ones(z.shape, bool)))
@@ -189,6 +196,65 @@ class MeasureTests(unittest.TestCase):
         sample = measure_person(points, valid, K, observation._replace(keypoint_scores=scores), body_outline())
         self.assertIsNone(sample.height)
         self.assertNotIn("shin_l", sample.widths)
+
+
+class SliceTests(unittest.TestCase):
+    def test_slices_follow_a_changing_width_along_the_body(self):
+        mask = np.zeros((320, 300), bool)
+        mask[0:160, 120:180] = True
+        mask[160:320, 100:200] = True
+        widths, split = body_slices(mask, (150., 0.), (150., 320.), 140, 1.)
+        self.assertEqual(len(widths), SLICES)
+        self.assertAlmostEqual(widths[3], 60, delta=2)
+        self.assertAlmostEqual(widths[-3], 100, delta=2)
+        self.assertFalse(any(split))
+
+    def test_two_separate_legs_are_recognised(self):
+        mask = np.zeros((320, 300), bool)
+        mask[:, 110:130] = True
+        mask[:, 170:190] = True
+        widths, split = body_slices(mask, (150., 0.), (150., 320.), 140, 1.)
+        self.assertTrue(all(split))
+        self.assertAlmostEqual(widths[10], 40, delta=2)
+
+    def test_slice_reaching_both_ends_is_an_arm_and_not_counted_as_body(self):
+        mask = np.zeros((320, 300), bool)
+        mask[:, 130:170] = True
+        mask[20:30, :] = True
+        widths, _ = body_slices(mask, (150., 0.), (150., 320.), 140, 1.)
+        self.assertTrue(math.isnan(widths[2]))
+        self.assertAlmostEqual(widths[20], 40, delta=2)
+
+    def test_arms_joining_the_shoulder_slices_are_replaced_by_the_chest_width(self):
+        row = [.40] * SLICES
+        row[0] = row[1] = .75
+        sample = sample_at()._replace(slice_widths=tuple(row), slice_split=(False,) * SLICES)
+        profile = slice_profile([sample] * 6)
+        self.assertAlmostEqual(float(profile[0]), .40, places=3)
+        self.assertAlmostEqual(float(profile[10]), .40, places=3)
+
+    def test_wide_hips_lower_down_are_kept(self):
+        row = [.32] * SLICES
+        row[14:20] = [.46] * 6
+        sample = sample_at()._replace(slice_widths=tuple(row), slice_split=(False,) * SLICES)
+        self.assertAlmostEqual(float(slice_profile([sample] * 6)[16]), .46, places=3)
+
+    def test_a_bust_or_buttocks_adds_volume_only_where_it_is(self):
+        flat = np.full(SLICES, .30)
+        side = np.full(SLICES, .20)
+        bigger = side.copy()
+        bigger[5:9] = .30
+        split = np.zeros(SLICES, bool)
+        self.assertGreater(slices_volume(flat, bigger, split, 1.4), slices_volume(flat, side, split, 1.4))
+        added = slices_volume(flat, bigger, split, 1.4) - slices_volume(flat, side, split, 1.4)
+        self.assertAlmostEqual(added, math.pi / 4 * .30 * .10 * 4 * 1.4 / SLICES, places=5)
+
+    def test_separate_legs_count_as_two_ellipses_not_one_wide_one(self):
+        front, side = np.full(SLICES, .32), np.full(SLICES, .16)
+        together = slices_volume(front, side, np.zeros(SLICES, bool), 1.)
+        apart = slices_volume(front, side, np.ones(SLICES, bool), 1.)
+        self.assertAlmostEqual(apart, together, places=6)
+        self.assertAlmostEqual(apart, SLICES * 2 * math.pi / 4 * .16 * .16 / SLICES, places=6)
 
 
 class EstimateTests(unittest.TestCase):
@@ -460,6 +526,7 @@ class SessionTests(unittest.TestCase):
         self.assertIs(data["validated_against_scales"], False)
         self.assertGreater(data["people"][0]["samples"], 12)
         self.assertNotIn("image", json.dumps(data))
+        self.assertEqual(len(data["people"][0]["slices_front_m"]), SLICES)
 
     def test_model_loading_failure_is_reported_not_silent(self):
         messages = []
@@ -518,6 +585,16 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Человек №2", text)
         self.assertIn("около", text)
         self.assertIn(f"{self.estimate.mass_low_kg:.0f}", text)
+
+    def test_outline_of_the_measured_body_is_visible_on_the_picture(self):
+        session = WeighingSession(lambda status: None)
+        frame = FakeFrame()
+        session.outlines_seen[1] = frame.outline
+        state = session.analyse(_single(frame), frame, K, 0.)
+        self.assertIs(state.people[0].outline, frame.outline)
+        drawn = draw_people(frame.left, state)
+        ys, xs = np.nonzero(frame.outline)
+        self.assertFalse(np.array_equal(drawn[ys[len(ys) // 2], xs[len(xs) // 2]], frame.left[ys[len(ys) // 2], xs[len(xs) // 2]]))
 
     def test_drawing_labels_people_without_touching_the_source_image(self):
         frame = FakeFrame()
