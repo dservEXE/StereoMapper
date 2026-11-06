@@ -6,6 +6,7 @@ import numpy as np
 
 from .depth import DepthFrame, depth_colors, scene_color_limits
 from .ghost_filter import supported_disparity
+from .maixsense import IR_FULL_SCALE
 from .mapping import VisualOdometry
 from .precision import PrecisionSnapshot, verify_stationary
 
@@ -20,6 +21,11 @@ MEDIAN_AGREEMENT_M = .03
 TEMPORAL_ALPHA = .5
 # Local contrast: on a live dark scene ORB found 464 features with it and 22 without.
 TRACKING_CLIP_LIMIT = 3.
+# Beyond the sensor's range the phase wraps round: a cabinet at about 4 m read as 0.6 m with
+# a normal status. Its signal gives it away, since reflected light falls with distance squared.
+# IR x z^2 measured on one live scene: wrapped 12-27, near surfaces 36-185, a wall at 1 m 170.
+MIN_SIGNAL_AT_DEPTH = 30.
+_IR_LINEAR = np.float32((np.arange(256) / 255) ** 2 * IR_FULL_SCALE)
 PRECISION_FRAMES = 5
 PRECISION_MIN_SAMPLES = 4
 # Below the camera's measured frame-to-frame jitter of about 1.6 mm and 0.1 degrees.
@@ -142,8 +148,10 @@ class TofEngine:
     depth_tolerance = staticmethod(tof_depth_tolerance)
     odometry_class = TofOdometry
 
-    def __init__(self, calibration, max_depth=TOF_MAX_RANGE_M, temporal=True, near_minimum=TOF_MIN_RANGE_M):
+    def __init__(self, calibration, max_depth=TOF_MAX_RANGE_M, temporal=True, near_minimum=TOF_MIN_RANGE_M,
+                 signal_filter=True):
         self.calibration = calibration
+        self.signal_filter = signal_filter
         self.maximum = min(float(max_depth), TOF_MAX_RANGE_M)
         self.minimum = max(float(near_minimum), TOF_MIN_RANGE_M)
         self.search_minimum = self.geometric_minimum = self.minimum
@@ -159,8 +167,12 @@ class TofEngine:
         self.maps = [(u, v), (u, v)]
         self.contrast = cv2.createCLAHE(TRACKING_CLIP_LIMIT, (8, 8))
 
-    def accepted(self, depth: np.ndarray, status: np.ndarray) -> np.ndarray:
+    def accepted(self, depth: np.ndarray, status: np.ndarray, ir_bgr: np.ndarray) -> np.ndarray:
         valid = (status == STATUS_NORMAL) & (depth >= self.minimum) & (depth <= self.maximum)
+        # Averaged over neighbours: single infrared pixels are too noisy at low signal.
+        if self.signal_filter:
+            signal = cv2.blur(_IR_LINEAR[ir_bgr[:, :, 0]], (3, 3)) * depth ** 2
+            valid &= signal >= MIN_SIGNAL_AT_DEPTH
         # Mixed returns on silhouettes have no neighbours on a common surface.
         log_depth = np.log(np.maximum(depth, 1e-3))
         return supported_disparity(log_depth, valid, FLYING_MIN_NEIGHBOURS, FLYING_LOG_TOLERANCE)
@@ -190,7 +202,7 @@ class TofEngine:
 
     def compute(self, ir_bgr, rgb, depth, status, color) -> DepthFrame:
         started = time.perf_counter()
-        valid = self.accepted(depth, status)
+        valid = self.accepted(depth, status, ir_bgr)
         filtered = self.denoise(depth, valid)
         if self.temporal:
             filtered = self.blend_previous(filtered, valid)
@@ -200,7 +212,7 @@ class TofEngine:
 
     def single(self, ir_bgr, rgb, depth, status, color) -> DepthFrame:
         """One independent measurement, untouched by temporal memory."""
-        valid = self.accepted(depth, status)
+        valid = self.accepted(depth, status, ir_bgr)
         return self.build(ir_bgr, self.denoise(depth, valid), valid, color)
 
     def distance_report(self) -> list:
@@ -212,13 +224,13 @@ class TofEngine:
         self.previous = None
 
 
-def tof_precision_snapshot(calibration, raws, max_depth=TOF_MAX_RANGE_M) -> PrecisionSnapshot:
+def tof_precision_snapshot(calibration, raws, max_depth=TOF_MAX_RANGE_M, signal_filter=True) -> PrecisionSnapshot:
     """Median of several stationary frames, keeping only pixels that repeat."""
     if len(raws) < PRECISION_FRAMES:
         raise ValueError(f"Для точного снимка нужно {PRECISION_FRAMES} отдельных кадров.")
     for raw in raws[1:]:
         verify_stationary(raws[0][0], raw[0])
-    engine = TofEngine(calibration, max_depth, temporal=False)
+    engine = TofEngine(calibration, max_depth, temporal=False, signal_filter=signal_filter)
     frames = [engine.single(*raw) for raw in raws]
     stack = np.stack([frame.points[:, :, 2] for frame in frames])
     values = np.ma.masked_invalid(stack)

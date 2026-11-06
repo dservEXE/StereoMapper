@@ -231,6 +231,35 @@ class EngineTests(unittest.TestCase):
         for value in (50, 1900):
             self.assertFalse(self.compute(value).valid.any(), value)
 
+    def test_dim_return_claiming_to_be_close_is_rejected_as_wrapped_phase(self):
+        # Values from a real saved frame: a cabinet at about 4 m read as 0.62 m with IR 46.
+        frame = self.compute(620, ir=np.full((240, 320), 46, np.uint16))
+        self.assertFalse(frame.valid.any())
+
+    def test_bright_near_surface_and_ordinary_wall_are_kept(self):
+        for depth_mm, ir in ((330, 1131), (400, 694), (360, 1016), (970, 180), (1400, 90)):
+            frame = self.compute(depth_mm, ir=np.full((240, 320), ir, np.uint16))
+            self.assertGreater(float(frame.valid.mean()), .9, (depth_mm, ir))
+
+    def test_only_the_wrapped_region_is_removed_from_a_mixed_scene(self):
+        depth = np.full((240, 320), 400, np.uint16)
+        ir = np.full((240, 320), 800, np.uint16)
+        depth[:, 200:], ir[:, 200:] = 620, 46
+        frame = self.compute(depth, ir=ir)
+        self.assertTrue(frame.valid[:, :190].all())
+        self.assertFalse(frame.valid[:, 210:].any())
+
+    def test_independent_measurement_uses_the_same_signal_check(self):
+        raw = raw_from(620, ir=np.full((240, 320), 46, np.uint16), geometry=self.geometry)
+        self.assertFalse(self.engine.single(*raw).valid.any())
+
+    def test_signal_filter_can_be_switched_off_and_back_on_live(self):
+        raw = raw_from(620, ir=np.full((240, 320), 46, np.uint16), geometry=self.geometry)
+        self.engine.signal_filter = False
+        self.assertGreater(float(self.engine.compute(*raw).valid.mean()), .9)
+        self.engine.signal_filter = True
+        self.assertFalse(self.engine.compute(*raw).valid.any())
+
     def test_holes_are_never_filled(self):
         status = np.zeros((240, 320), np.uint8)
         status[100:140, 100:140] = 3
@@ -315,6 +344,16 @@ class PrecisionTests(unittest.TestCase):
         self.assertIsInstance(result, PrecisionSnapshot)
         self.assertAlmostEqual(float(result.frame.points[120, 160, 2]), .8, places=3)
         self.assertIs(result.calibration, result.source_calibration)
+
+    def test_snapshot_follows_the_signal_filter_setting(self):
+        dim = (np.full((240, 320), 40, np.uint16) + self.ir // 500).astype(np.uint16)
+        raws = [raw_from(620, ir=dim, geometry=self.geometry) for _ in range(5)]
+        # This dim view has too little detail for the separate stillness check.
+        with patch("stereo.tof_engine.verify_stationary"):
+            kept = tof_precision_snapshot(self.geometry.calibration, raws, signal_filter=False)
+            self.assertGreater(float(kept.frame.valid.mean()), .9)
+            with self.assertRaisesRegex(ValueError, "устойчивой глубины"):
+                tof_precision_snapshot(self.geometry.calibration, raws, signal_filter=True)
 
     def test_needs_five_frames(self):
         with self.assertRaises(ValueError):
@@ -718,6 +757,18 @@ class WorkerTests(unittest.TestCase):
             metadata = json.loads((Path(exported) / "metadata.json").read_text(encoding="utf-8"))
             self.assertIsNone(metadata["baseline_m"])
 
+    def test_signal_filter_starts_from_the_setting_and_switches_while_running(self):
+        with self.session() as temp:
+            worker = self.start_worker(temp, signal_filter=False)
+            self.wait_for(worker, ("tof_ready",))
+            self.assertFalse(worker.engine.signal_filter)
+            worker.commands.put(("signal_filter", True))
+            deadline = time.time() + 5
+            while not worker.engine.signal_filter and time.time() < deadline:
+                time.sleep(.02)
+            self.assertTrue(worker.engine.signal_filter)
+            self.assertTrue(worker.signal_filter)
+
     def test_stereo_calibration_commands_are_refused_clearly(self):
         with self.session() as temp:
             worker = self.start_worker(temp)
@@ -801,6 +852,27 @@ class AppTests(unittest.TestCase):
         self.app.load_settings()
         self.assertEqual(self.app.vars["mode"].get(), TOF_LABEL)
         self.assertEqual(self.app.vars["tof_address"].get(), "10.0.0.5")
+
+    def test_signal_filter_switch_defaults_on_and_reaches_the_worker_options(self):
+        self.assertTrue(self.app.depth_options()["signal_filter"])
+        self.app.vars["tof_signal_filter"].set(False)
+        self.assertFalse(self.app.depth_options()["signal_filter"])
+
+    def test_signal_filter_switch_is_saved_and_restored(self):
+        (Path(self.temp.name) / "settings.json").write_text(json.dumps(
+            dict(settings_version=3, tof_signal_filter=False)), encoding="utf-8")
+        self.app.load_settings()
+        self.assertFalse(self.app.vars["tof_signal_filter"].get())
+
+    def test_changing_the_switch_while_connected_sends_it_at_once(self):
+        sent = []
+        self.app.send = lambda name, value=None: sent.append((name, value))
+        self.app.vars["tof_signal_filter"].set(False)
+        self.app.update_signal_filter()
+        self.assertEqual(sent, [])
+        self.app.connected = True
+        self.app.update_signal_filter()
+        self.assertEqual(sent, [("signal_filter", False)])
 
     def test_calibration_actions_are_disabled_for_the_tof_camera(self):
         self.app.worker = SimpleNamespace(is_tof=True, engine=object(), frame=None, scan=None,

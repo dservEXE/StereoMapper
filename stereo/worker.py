@@ -33,10 +33,12 @@ def stamp():
 class CameraWorker(Thread):
     def __init__(self, root, config, pattern, square_mm, max_depth, disparities,
                  quality="balanced", processing_width=640, temporal=True, near_priority=True, voxel_mm=5., wide_view=True,
-                 map_stride=2, preview_points=250000, estimate_surfaces=True, near_minimum=.10,acceleration="auto",ghost_filter="normal"):
+                 map_stride=2, preview_points=250000, estimate_surfaces=True, near_minimum=.10,acceleration="auto",ghost_filter="normal",
+                 signal_filter=True):
         super().__init__(daemon=True)
         self.root, self.config = Path(root), config
         self.is_tof = config.mode == TOF_MODE
+        self.signal_filter = signal_filter
         if self.is_tof:
             max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
         self.log_path=self.root/"data"/"logs"/f"events_{stamp()}.jsonl"
@@ -166,7 +168,7 @@ class CameraWorker(Thread):
     def start_tof(self, camera):
         """A ToF camera measures metric depth itself: factory geometry replaces calibration."""
         self.calibration = camera.geometry.calibration
-        self.engine = TofEngine(self.calibration, self.max_depth, self.temporal, self.near_minimum)
+        self.engine = TofEngine(self.calibration, self.max_depth, self.temporal, self.near_minimum, self.signal_filter)
         self.frame = None
         self.reset_map()
 
@@ -195,6 +197,12 @@ class CameraWorker(Thread):
             if self.engine:
                 self.engine.estimate_surfaces = self.estimate_surfaces
             self.emit("status", "Оценка поверхностей включена" if value else "Оценка поверхностей выключена; нагрузка уменьшена")
+        elif name == "signal_filter":
+            self.signal_filter = bool(value)
+            if is_tof and self.engine:
+                self.engine.signal_filter = self.signal_filter
+                self.emit("status", "Ложная глубина отсекается" if value else
+                          "Отсев ложной глубины выключен: дальние предметы могут выглядеть близкими")
         elif name == "board_settings":
             columns, rows, square_mm = value
             if (columns, rows) != self.pattern or abs(square_mm - self.square_mm) > 1e-5:
@@ -233,7 +241,7 @@ class CameraWorker(Thread):
                     return
                 pairs.append(capture[0])
             if is_tof:
-                result = tof_precision_snapshot(self.calibration, pairs, self.max_depth)
+                result = tof_precision_snapshot(self.calibration, pairs, self.max_depth, self.signal_filter)
             else:
                 result = make_precision_snapshot(self.calibration, pairs, self.wide_view,
                                                 lambda text: self.emit("status", text))
@@ -304,7 +312,7 @@ class CameraWorker(Thread):
             options=dict(value)
             options.setdefault('ghost_filter',self.ghost_filter if self.ghost_filter in ('normal','strict') else 'normal')
             scan_depth,scan_near=options.pop('max_depth',self.max_depth),options.pop('near_minimum',self.near_minimum)
-            engine=TofEngine(self.calibration,scan_depth,False,scan_near) if is_tof else None
+            engine=TofEngine(self.calibration,scan_depth,False,scan_near,self.signal_filter) if is_tof else None
             self.scan=ObjectScan(self.root/"output"/f"scan_{stamp()}",self.calibration,
                 wide_view=self.wide_view,acceleration=self.acceleration,max_depth=scan_depth,
                 near_minimum=scan_near,engine=engine,**options)
@@ -443,6 +451,7 @@ class CameraWorker(Thread):
                     "visible_cloud_axes": "current rectified left camera: X right, Y down, Z forward",
                     "method": self.engine.acceleration+" + ORB/PnP odometry; no loop closure",
                     "max_depth_m": self.max_depth, "valid_fraction": float(f.valid.mean()),
+                    "tof_signal_filter": self.signal_filter if self.is_tof else None,
                     "displayed_map": "accumulated" if self.mapping else "current_view",
                     "source_size": self.calibration.size, "processing_size": self.engine.calibration.size,
                     "quality": self.quality, "near_priority": self.near_priority, "wide_view": self.wide_view,

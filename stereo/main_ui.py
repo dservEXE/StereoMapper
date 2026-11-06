@@ -74,6 +74,7 @@ def build(app):
     mode=ttk.Combobox(mode_row,textvariable=app.vars["mode"],values=("Две камеры","Два вида рядом",TOF_LABEL),state="readonly")
     mode.pack(side="left",fill="x",expand=True); app.settings_controls.append((mode,"readonly"))
     fields(camera,[("Левая камера","left"),("Правая камера","right"),("Адрес MaixSense","tof_address")])
+    app.check(camera,"MaixSense: отсекать ложную глубину",app.vars["tof_signal_filter"],"tof_signal_filter",command=app.update_signal_filter)
     ttk.Label(camera,text="Что вы снимаете?",style="Section.TLabel").pack(anchor="w",pady=(10,4))
     preset=ttk.Combobox(camera,textvariable=app.vars["profile"],values=("Свои настройки",*PRESETS),state="readonly")
     preset.pack(fill="x"); preset.bind("<<ComboboxSelected>>",lambda e:app.apply_preset())

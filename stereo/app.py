@@ -113,6 +113,7 @@ class StereoApp:
                      "fps": tk.StringVar(value="15"), "backend": tk.StringVar(value="AUTO"),
                      "mode": tk.StringVar(value="Две камеры"), "swap": tk.BooleanVar(value=False),
                      "tof_address": tk.StringVar(value="192.168.233.1"),
+                     "tof_signal_filter": tk.BooleanVar(value=True),
                      "columns": tk.StringVar(value="9"), "rows": tk.StringVar(value="6"),
                      "square_mm": tk.StringVar(value="25"), "max_depth": tk.StringVar(value="8"),
                      "disparities": tk.StringVar(value="128"), "quality": tk.StringVar(value="Сбалансированная"),
@@ -268,7 +269,8 @@ class StereoApp:
                 "map_stride":int(self.vars["map_stride"].get()),"preview_points":int(self.vars["preview_points"].get()),
                 "estimate_surfaces":self.smooth_depth.get(),"near_minimum":float(self.vars["near_minimum_cm"].get())/100,
                 "acceleration":{"Авто · NVIDIA / CPU":"auto","Процессор":"cpu","NVIDIA CUDA":"cuda"}[self.vars["acceleration"].get()],
-                "ghost_filter":{"Обычная":"normal","Строгая":"strict","Выключена":"off"}[self.vars['ghost_filter'].get()]}
+                "ghost_filter":{"Обычная":"normal","Строгая":"strict","Выключена":"off"}[self.vars['ghost_filter'].get()],
+                "signal_filter":self.vars["tof_signal_filter"].get()}
 
     def storage_protected(self):
         paths=[]
@@ -337,6 +339,10 @@ class StereoApp:
                       "Для скорости: выключите оценку поверхностей, уменьшите ширину расчёта; для комнаты выключите ближний поиск.",
                       "Мелкий шаг карты и каждый пиксель повышают плотность, но увеличивают нагрузку на запись."])
         messagebox.showinfo("Производительность последнего кадра","\n".join(lines))
+
+    def update_signal_filter(self):
+        if self.connected:
+            self.send("signal_filter",self.vars["tof_signal_filter"].get())
 
     def toggle_connect(self):
         if self.worker and self.worker.is_alive():
