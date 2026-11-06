@@ -2,6 +2,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from .ghost_filter import tracking_gray
 from .map_store import VoxelMap
 
 
@@ -41,9 +42,9 @@ def estimate_motion(objects, pixels, K):
 
 class VisualOdometry:
     """Stereo metric odometry. No loop closure, global optimization or IMU."""
-    def __init__(self, K, initial_pose=None):
+    def __init__(self, K, initial_pose=None, orb=None):
         self.K = K.copy()
-        self.orb = cv2.ORB_create(nfeatures=1800, fastThreshold=12)
+        self.orb = orb or cv2.ORB_create(nfeatures=1800, fastThreshold=12)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self.reference = None
         self.world_pose = np.eye(4) if initial_pose is None else np.array(initial_pose, dtype=float, copy=True)
@@ -57,7 +58,7 @@ class VisualOdometry:
         self.motion_mm = self.motion_deg = 0.
 
     def set_reference(self, frame):
-        gray = cv2.cvtColor(frame.left, cv2.COLOR_BGR2GRAY)
+        gray = tracking_gray(frame)
         mask = np.uint8(frame.valid) * 255
         kp, des = self.orb.detectAndCompute(gray, mask)
         if des is None or len(kp) < 80:
@@ -101,15 +102,12 @@ class VisualOdometry:
         motion, inliers = estimate_motion(source, target, self.K)
         return (reference_pose @ np.linalg.inv(motion) if motion is not None else None), inliers
 
-    def update(self, frame):
-        if self.reference is None:
-            if self.set_reference(frame):
-                return self.world_pose.copy(), "Начало карты; двигайте камеру медленно"
-            return None, "Нужно больше резких деталей и достоверной глубины"
-        gray = cv2.cvtColor(frame.left, cv2.COLOR_BGR2GRAY)
+    def locate(self, frame):
+        """Find the camera against the reference: (pose or None, supports, relocalized)."""
+        gray = tracking_gray(frame)
         kp, descriptors = self.orb.detectAndCompute(gray, None)
         if descriptors is None or len(kp) < 20:
-            return None, "Слежение потеряно: мало деталей; вернитесь к последнему ракурсу"
+            return None, None, False
         pose, inliers = self.match_reference(self.reference, kp, descriptors)
         recovered = False
         if pose is None:
@@ -120,12 +118,25 @@ class VisualOdometry:
                     pose, inliers, recovered = candidate, count, True
                     self.relocalizations += 1
                     break
-        if pose is None:
-            return None, f"Слежение потеряно ({inliers} опор); точки не добавляются"
+        return pose, inliers, recovered
+
+    def commit(self, pose, frame):
         self.motion_mm = float(np.linalg.norm(pose[:3, 3] - self.world_pose[:3, 3]) * 1000)
         self.motion_deg = float(np.rad2deg(np.linalg.norm(cv2.Rodrigues(self.world_pose[:3, :3].T @ pose[:3, :3])[0])))
         self.world_pose = pose
         self.set_reference(frame)
+
+    def update(self, frame):
+        if self.reference is None:
+            if self.set_reference(frame):
+                return self.world_pose.copy(), "Начало карты; двигайте камеру медленно"
+            return None, "Нужно больше резких деталей и достоверной глубины"
+        pose, inliers, recovered = self.locate(frame)
+        if inliers is None:
+            return None, "Слежение потеряно: мало деталей; вернитесь к последнему ракурсу"
+        if pose is None:
+            return None, f"Слежение потеряно ({inliers} опор); точки не добавляются"
+        self.commit(pose, frame)
         return self.world_pose.copy(), ("Положение восстановлено; " if recovered else "") + (
             f"{inliers} опор · смещение {self.motion_mm:.1f} мм · поворот {self.motion_deg:.1f}°; карта накапливается")
 

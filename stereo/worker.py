@@ -19,6 +19,11 @@ from .map_preview import MapPreview
 from .map_integrator import MapIntegrator
 from .ghost_filter import MultiViewConfirmation
 from .cloud_orientation import initial_camera_pose
+from .maixsense import MaixSensePump, TOF_MODE
+from .tof_engine import TofEngine, TOF_MAX_RANGE_M, tof_precision_snapshot
+
+STEREO_ONLY_COMMANDS = {"capture", "capture_after", "calibrate", "new_series", "load",
+                        "restore_series", "board_settings"}
 
 
 def stamp():
@@ -31,6 +36,9 @@ class CameraWorker(Thread):
                  map_stride=2, preview_points=250000, estimate_surfaces=True, near_minimum=.10,acceleration="auto",ghost_filter="normal"):
         super().__init__(daemon=True)
         self.root, self.config = Path(root), config
+        self.is_tof = config.mode == TOF_MODE
+        if self.is_tof:
+            max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
         self.log_path=self.root/"data"/"logs"/f"events_{stamp()}.jsonl"
         self.log_lock=Lock()
         self.pattern, self.square_mm = pattern, square_mm
@@ -142,18 +150,32 @@ class CameraWorker(Thread):
             "initial_rectified_camera_to_world":initial_camera_pose(self.engine.calibration).tolist() if self.engine else None,
             "map_stride":self.map_stride,
             "measured_store":"measured.sqlite","estimated_store":"estimated.sqlite"},indent=2),encoding="utf-8")
-        self.odometry = VisualOdometry(self.engine.calibration.P1[:, :3],
+        odometry_class = getattr(self.engine, "odometry_class", VisualOdometry)
+        self.odometry = odometry_class(self.engine.calibration.P1[:, :3],
             initial_pose=initial_camera_pose(self.engine.calibration)) if self.engine else None
         if self.odometry and self.is_alive():
             confirmation=MultiViewConfirmation(self.engine.calibration.P1[:,:3],self.calibration.baseline,
-                observations=3 if self.ghost_filter=='strict' else 2) if self.ghost_filter!='off' else None
+                observations=3 if self.ghost_filter=='strict' else 2,
+                depth_tolerance=getattr(self.engine,"depth_tolerance",None)) if self.ghost_filter!='off' else None
             self.map_integrator=MapIntegrator(self.odometry,self.cloud,self.estimated_cloud,confirmation)
             self.map_integrator.start()
         self.integrated_frames = self.mapping_attempts = 0
         self.map_times.clear()
         self.emit("map_count", 0)
 
+    def start_tof(self, camera):
+        """A ToF camera measures metric depth itself: factory geometry replaces calibration."""
+        self.calibration = camera.geometry.calibration
+        self.engine = TofEngine(self.calibration, self.max_depth, self.temporal, self.near_minimum)
+        self.frame = None
+        self.reset_map()
+
     def command(self, name, value=None):
+        is_tof = getattr(self, "is_tof", False)
+        if is_tof and name in STEREO_ONLY_COMMANDS:
+            if name == "board_settings":
+                return
+            raise ValueError("MaixSense измеряет глубину сама: стереокалибровка и съёмка доски ей не нужны.")
         if self.calibration_busy and name in ('calibrate','capture','new_series','board_settings','load','restore_series','precision','scan_start'):
             raise ValueError("Расчёт калибровки ещё идёт; дождитесь результата. Видео продолжает работать.")
         if self.scan and name not in ('scan_stop','scan_extend','distance_report'):
@@ -182,11 +204,14 @@ class CameraWorker(Thread):
         elif name == "measure_snapshot":
             if self.engine is None or value["calibration_token"] != id(self.engine):
                 raise ValueError("Калибровка изменилась или отсутствует. Повторите измерение.")
-            if self.snapshot_engine is None:
-                self.snapshot_engine = DepthEngine(self.calibration, self.max_depth, self.disparities,
-                    self.quality, self.processing_width, temporal=False, near_priority=self.near_priority,
-                    wide_view=self.wide_view,estimate_surfaces=False,near_minimum=self.near_minimum)
-            snapshot = self.snapshot_engine.compute(*value["raw"])
+            if is_tof:
+                snapshot = self.engine.single(*value["raw"])
+            else:
+                if self.snapshot_engine is None:
+                    self.snapshot_engine = DepthEngine(self.calibration, self.max_depth, self.disparities,
+                        self.quality, self.processing_width, temporal=False, near_priority=self.near_priority,
+                        wide_view=self.wide_view,estimate_surfaces=False,near_minimum=self.near_minimum)
+                snapshot = self.snapshot_engine.compute(*value["raw"])
             self.emit("snapshot_measurement", measure(snapshot, *value["point"]))
         elif name == "distance_report":
             if self.engine is None:
@@ -207,8 +232,11 @@ class CameraWorker(Thread):
                 if capture is None:
                     return
                 pairs.append(capture[0])
-            result = make_precision_snapshot(self.calibration, pairs, self.wide_view,
-                                            lambda text: self.emit("status", text))
+            if is_tof:
+                result = tof_precision_snapshot(self.calibration, pairs, self.max_depth)
+            else:
+                result = make_precision_snapshot(self.calibration, pairs, self.wide_view,
+                                                lambda text: self.emit("status", text))
             self.emit("precision", result)
             self.emit("status", "Подробный снимок готов. Измерьте размер и проверьте эталон.")
         elif name == "capture_after":
@@ -275,9 +303,11 @@ class CameraWorker(Thread):
             self.emit("status","Подготавливаю подробное накопление; двигайте камеру медленно…")
             options=dict(value)
             options.setdefault('ghost_filter',self.ghost_filter if self.ghost_filter in ('normal','strict') else 'normal')
+            scan_depth,scan_near=options.pop('max_depth',self.max_depth),options.pop('near_minimum',self.near_minimum)
+            engine=TofEngine(self.calibration,scan_depth,False,scan_near) if is_tof else None
             self.scan=ObjectScan(self.root/"output"/f"scan_{stamp()}",self.calibration,
-                wide_view=self.wide_view,acceleration=self.acceleration,max_depth=options.pop('max_depth',self.max_depth),
-                near_minimum=options.pop('near_minimum',self.near_minimum),**options)
+                wide_view=self.wide_view,acceleration=self.acceleration,max_depth=scan_depth,
+                near_minimum=scan_near,engine=engine,**options)
             self.emit("scan_started",str(self.scan.directory))
         elif name == "scan_extend":
             if self.scan:
@@ -442,7 +472,8 @@ class CameraWorker(Thread):
         try:
             self.map_renderer = MapPreview()
             self.map_renderer.start()
-            camera = CapturePump(self.config, lambda message: self.emit("status", message))
+            source = MaixSensePump if self.is_tof else CapturePump
+            camera = source(self.config, lambda message: self.emit("status", message))
             camera.previews = self.previews
             self.capture_pump = camera
             camera.start()
@@ -455,14 +486,23 @@ class CameraWorker(Thread):
             log = self.root / "data" / "logs" / f"capture_{stamp()}.json"
             log.parent.mkdir(parents=True, exist_ok=True)
             log.write_text(json.dumps(self.capture_info, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.new_series()
-            default = self.root / "data" / "calibration.npz"
-            if default.exists():
-                try:
-                    self.apply_calibration(Calibration.load(default))
-                except Exception as error:
-                    self.emit("status", f"Просмотр включён; калибровка не применена: {error}")
+            if self.is_tof:
+                self.start_tof(camera)
+            else:
+                self.new_series()
+                default = self.root / "data" / "calibration.npz"
+                if default.exists():
+                    try:
+                        self.apply_calibration(Calibration.load(default))
+                    except Exception as error:
+                        self.emit("status", f"Просмотр включён; калибровка не применена: {error}")
             self.emit("connected", (self.raw[0].shape[1], self.raw[0].shape[0]))
+            if self.is_tof:
+                self.depth_enabled = True
+                self.emit("depth_enabled", True)
+                self.emit("tof_ready", dict(self.capture_info, maximum=self.engine.maximum,
+                                            minimum=self.engine.minimum))
+                self.emit("status", "MaixSense подключена: глубина считается сразу, калибровка не нужна.")
             fps = 0.0
             while not self.stop_event.is_set():
                 capture = camera.take(self.stop_event)

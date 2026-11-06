@@ -22,11 +22,13 @@ class CameraConfig:
     mode: str = "dual"
     swap: bool = False
     backend: str = "AUTO"
+    address: str = "http://192.168.233.1"
 
     def signature(self):
         # Resolution is checked separately against the actual delivered frames.
+        # The address belongs to the ToF camera: saved stereo calibrations must still match.
         return json.dumps({k: v for k, v in asdict(self).items()
-                           if k not in ("width", "height", "fps", "backend")}, sort_keys=True)
+                           if k not in ("width", "height", "fps", "backend", "address")}, sort_keys=True)
 
 
 def open_device(index, config, pixel_format="MJPG"):

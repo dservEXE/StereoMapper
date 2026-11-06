@@ -14,6 +14,7 @@ from PIL import Image, ImageTk
 from .camera import CameraConfig
 from .depth import measure
 from .worker import CameraWorker
+from .maixsense import TOF_LABEL, TOF_MODE, normalize_address
 from .viewer import CloudViewer
 from .board import BoardSpec, BoardWindow
 from .calibration_ui import CalibrationShortcuts
@@ -111,6 +112,7 @@ class StereoApp:
                      "width": tk.StringVar(value="640"), "height": tk.StringVar(value="480"),
                      "fps": tk.StringVar(value="15"), "backend": tk.StringVar(value="AUTO"),
                      "mode": tk.StringVar(value="Две камеры"), "swap": tk.BooleanVar(value=False),
+                     "tof_address": tk.StringVar(value="192.168.233.1"),
                      "columns": tk.StringVar(value="9"), "rows": tk.StringVar(value="6"),
                      "square_mm": tk.StringVar(value="25"), "max_depth": tk.StringVar(value="8"),
                      "disparities": tk.StringVar(value="128"), "quality": tk.StringVar(value="Сбалансированная"),
@@ -142,7 +144,7 @@ class StereoApp:
             for key, value in data.items():
                 if key in self.vars:
                     if key == "mode":
-                        value = {"dual": "Две камеры", "sbs": "Два вида рядом"}.get(value, value)
+                        value = {"dual": "Две камеры", "sbs": "Два вида рядом", TOF_MODE: TOF_LABEL}.get(value, value)
                     self.vars[key].set(value)
         except (OSError, ValueError, tk.TclError):
             pass
@@ -192,6 +194,7 @@ class StereoApp:
         if not hasattr(self,"workflow") or self.closing:return
         worker=self.worker
         calibrated=bool(self.connected and worker and getattr(worker,"engine",None))
+        is_tof=bool(worker and getattr(worker,"is_tof",False))
         frame=bool(worker and getattr(worker,"frame",None) is not None)
         scan_active=bool(worker and getattr(worker,"scan",None) is not None) or bool(self.scan_window and self.scan_window.window.winfo_exists() and self.scan_window.active)
         signature=(self.connected,self.connection_pending,calibrated,frame,self.depth_enabled.get(),
@@ -201,8 +204,8 @@ class StereoApp:
         self.ui_signature=signature
         available=dict(connected=self.connected and not self.calibration_busy,
                        calibrated=calibrated and not self.calibration_busy,
-                       capture=self.connected and not self.calibration_busy and not self.capture_pending,
-                       calibrate=self.connected and self.calibration_pairs>=15 and not self.calibration_busy,
+                       capture=self.connected and not is_tof and not self.calibration_busy and not self.capture_pending,
+                       calibrate=self.connected and not is_tof and self.calibration_pairs>=15 and not self.calibration_busy,
                        frame=frame)
         for control,capability in self.ui_actions:
             control.configure(state="normal" if available[capability] and not scan_active and not self.connection_pending else "disabled")
@@ -213,7 +216,8 @@ class StereoApp:
         self.calibrate_button.configure(text="Рассчитываю калибровку…" if self.calibration_busy else "Рассчитать калибровку")
         self.calibration_progress.configure(value=min(15,self.calibration_pairs))
         self.connection_badge.set("Камеры подключены" if self.connected else "Подключаю камеры…" if self.connection_pending else "Камеры не подключены")
-        self.calibration_badge.set("Калибровка готова" if calibrated else "Калибровка не загружена")
+        self.calibration_badge.set("Калибровка не нужна" if is_tof and calibrated else
+                                   "Калибровка готова" if calibrated else "Калибровка не загружена")
         self.connection_label.configure(style="Success.TLabel" if self.connected else "Badge.TLabel")
         self.calibration_label.configure(style="Success.TLabel" if calibrated else "Badge.TLabel")
         if calibrated:self.camera_measurement.grid()
@@ -234,10 +238,11 @@ class StereoApp:
 
     def parse(self):
         val = lambda key: self.vars[key].get()
+        mode = {"Две камеры": "dual", "Два вида рядом": "sbs", TOF_LABEL: TOF_MODE}.get(val("mode"), val("mode"))
+        address = normalize_address(val("tof_address")) if mode == TOF_MODE else CameraConfig.address
         config = CameraConfig(left=int(val("left")), right=int(val("right")), width=int(val("width")),
-                              height=int(val("height")), fps=int(val("fps")),
-                              mode={"Две камеры": "dual", "Два вида рядом": "sbs"}.get(val("mode"), val("mode")),
-                              swap=bool(val("swap")), backend=val("backend"))
+                              height=int(val("height")), fps=int(val("fps")), mode=mode,
+                              swap=bool(val("swap")), backend=val("backend"), address=address)
         pattern = int(val("columns")), int(val("rows"))
         square, maximum = float(val("square_mm").replace(",", ".")), float(val("max_depth").replace(",", "."))
         disparities = int(val("disparities"))
@@ -422,6 +427,9 @@ class StereoApp:
         if not self.connected:
             self.status.set("Сначала подключите камеры.")
             return False
+        if getattr(self.worker, "is_tof", False):
+            self.status.set("MaixSense измеряет глубину сама: съёмка калибровочной доски ей не нужна.")
+            return False
         if self.capture_pending:
             return False
         if self.calibration_busy:
@@ -490,7 +498,7 @@ class StereoApp:
                                              self.capture_calibration, self.count,
                                              status_var=self.status, shortcuts=self.capture_shortcuts)
             if self.preview_last is not None:
-                self.board_window.preview.set_frames(self.preview_last["raw"])
+                self.board_window.preview.set_frames(self.preview_last["raw"][:2])
             self.board_window.preview.set_hidden(self.capture_pending)
         except (ValueError, OSError, tk.TclError) as error:
             messagebox.showerror("Доска", str(error))
@@ -624,6 +632,14 @@ class StereoApp:
                                                 f"геометрический предел перекрытия примерно {engine.geometric_minimum * 100:.0f} см"+
                                                 (". Для 10–15 см включите ближний поиск или выберите профиль с 15 см до подключения."
                                                  if engine.search_minimum>.15 else ""))
+                    elif kind == "tof_ready":
+                        self.selected = None
+                        self.measurement.set("Щёлкните по объекту на инфракрасном изображении или на карте глубины.")
+                        self.calibration_text.set(f"MaixSense {value.get('serial', '')}: заводская геометрия · "
+                                                  f"fx {value.get('fx', 0):.1f} px · калибровка не нужна")
+                        self.range_text.set(f"Датчик измеряет глубину сам · рабочий диапазон этого режима "
+                                            f"{value['minimum'] * 100:.0f} см – {value['maximum']:.1f} м")
+                        self.calibration_hint.set("Для MaixSense стереокалибровка не требуется.")
                     elif kind == "mapping":
                         self.mapping.set(value)
                     elif kind == "depth_enabled":
@@ -689,7 +705,8 @@ class StereoApp:
                     self.stats.set(f"{capture.get('backend', '')} · вход {source_size[0]} × {source_size[1]} · " +
                                    ("NVIDIA CUDA · " if str(packet.get('acceleration','')).startswith('NVIDIA') else "CPU · ")+
                                    processing +
-                                   f"захват {packet.get('capture_fps', 0):.1f} пар/с · "
+                                   f"захват {packet.get('capture_fps', 0):.1f} "
+                                   f"{'кадров' if getattr(self.worker, 'is_tof', False) else 'пар'}/с · "
                                    f"{depth_status}{valid}{nearest}")
                     self.map_stats.set(f"Получено пар: {packet.get('received_frames', 0)} · "
                                        f"кадров глубины: {packet.get('depth_frames', 0)} · "
@@ -727,6 +744,10 @@ class StereoApp:
             # Maps point into the full source frames and produce the processing size.
             images = [cv2.remap(image, *maps, cv2.INTER_LINEAR)
                       for image, maps in zip(raw, engine.maps)]
+            token = id(engine)
+        elif getattr(engine, "aligned_preview", False):
+            # Infrared, colour: the depth and status arrays travel on to the engine only.
+            images = [image.copy() for image in raw[:2]]
             token = id(engine)
         else:
             images = [image.copy() for image in raw]

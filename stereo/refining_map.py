@@ -5,10 +5,11 @@ from .map_store import VoxelMap
 
 
 class RefiningMap(VoxelMap):
-    def __init__(self,*args,K,baseline,**kwargs):
+    def __init__(self,*args,K,baseline,depth_tolerance=None,**kwargs):
         super().__init__(*args,**kwargs)
         self.K=np.asarray(K,np.float64)
-        self.baseline=float(baseline)
+        self.depth_tolerance=depth_tolerance
+        self.baseline=None if depth_tolerance else float(baseline)
         self.cursor=0
         self.removed=0
         self.pending=0
@@ -49,7 +50,9 @@ class RefiningMap(VoxelMap):
         lo=cv2.erode(np.where(frame.valid,depth,np.inf).astype(np.float32),kernel)
         hi=cv2.dilate(np.where(frame.valid,depth,-np.inf).astype(np.float32),kernel)
         current=depth[y,x]
-        tolerance=np.maximum(max(.003,3*self.voxel),3*safe**2/(self.K[0,0]*self.baseline))
+        sensor=(3*self.depth_tolerance(safe) if self.depth_tolerance
+                else 3*safe**2/(self.K[0,0]*self.baseline))
+        tolerance=np.maximum(max(.003,3*self.voxel),sensor)
         span=hi[y,x].astype(np.float64)-lo[y,x].astype(np.float64)
         reliable=inside&interior[y,x]&np.isfinite(current)&(span>=0)&(span<=tolerance)
         free_space=reliable & (current>z+tolerance)

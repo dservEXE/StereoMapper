@@ -16,7 +16,7 @@ from .cloud_orientation import initial_camera_pose
 class ObjectScan:
     def __init__(self,directory,calibration,*,wide_view=True,acceleration="auto",width=None,
                  max_depth=1.2,near_minimum=.10,voxel_mm=1.,minimum_seconds=5.,
-                 maximum_seconds=60.,automatic=True,region=None,ghost_filter="normal"):
+                 maximum_seconds=60.,automatic=True,region=None,ghost_filter="normal",engine=None):
         if ghost_filter not in ('normal','strict'):
             raise ValueError("Для объёмного снимка выберите обычную или строгую защиту.")
         self.directory=Path(directory)
@@ -24,18 +24,19 @@ class ObjectScan:
         self.engine=None
         self.cloud=None
         try:
-            self.engine=DepthEngine(calibration,max_depth=max_depth,disparities=192,quality="high",
+            self.engine=engine or DepthEngine(calibration,max_depth=max_depth,disparities=192,quality="high",
                 processing_width=width,temporal=False,near_priority=True,wide_view=wide_view,
                 detail=True,estimate_surfaces=False,near_minimum=near_minimum,
                 acceleration=acceleration,parallel=True,ghost_filter=ghost_filter)
+            tolerance=getattr(self.engine,"depth_tolerance",None)
             self.settings=dict(max_depth=max_depth,near_minimum=near_minimum,region=region,
                 ghost_filter=ghost_filter,wide_view=wide_view,quality="high",map_stride=1)
             K=self.engine.calibration.P1[:,:3]
             self.cloud=RefiningMap(path=self.directory/"measured.sqlite",voxel=voxel_mm/1000,
-                stride=1,K=K,baseline=calibration.baseline)
+                stride=1,K=K,baseline=calibration.baseline,depth_tolerance=tolerance)
             self.initial_pose=initial_camera_pose(self.engine.calibration)
-            self.odometry=VisualOdometry(K,initial_pose=self.initial_pose)
-            self.confirmation=MultiViewConfirmation(K,calibration.baseline,3,image_motion=True)
+            self.odometry=getattr(self.engine,"odometry_class",VisualOdometry)(K,initial_pose=self.initial_pose)
+            self.confirmation=MultiViewConfirmation(K,calibration.baseline,3,image_motion=True,depth_tolerance=tolerance)
             domain=self.engine.roi_mask.copy()
             if region:
                 # Region is normalized to the rectified view, so resolution can change.

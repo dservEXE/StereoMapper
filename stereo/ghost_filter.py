@@ -20,10 +20,18 @@ def supported_disparity(disparity,valid,minimum=3,tolerance=1.25):
     return valid & (count>=minimum)
 
 
+def tracking_gray(frame):
+    """Image used to follow motion: ToF infrared when present, since colour views hold a seam."""
+    tracking=getattr(frame,"tracking",None)
+    return tracking if tracking is not None else cv2.cvtColor(frame.left,cv2.COLOR_BGR2GRAY)
+
+
 class MultiViewConfirmation:
-    def __init__(self,K,baseline,observations=2,image_motion=False):
+    def __init__(self,K,baseline,observations=2,image_motion=False,depth_tolerance=None):
         self.K=np.asarray(K,np.float64)
-        self.baseline=float(baseline)
+        # A direct depth sensor has no stereo base: its noise model replaces the disparity one.
+        self.depth_tolerance=depth_tolerance
+        self.baseline=None if depth_tolerance else float(baseline)
         self.required=observations-1
         self.history=deque(maxlen=self.required)
         self.image_motion=image_motion
@@ -33,7 +41,7 @@ class MultiViewConfirmation:
         h,w=current.left.shape[:2]
         scale=min(1.,640/w)
         size=(round(w*scale),round(h*scale))
-        a,b=[cv2.cvtColor(cv2.resize(f.left,size),cv2.COLOR_BGR2GRAY) for f in (current,previous)]
+        a,b=[cv2.resize(tracking_gray(f),size) for f in (current,previous)]
         forward=cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM).calc(a,b,None)
         backward=cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM).calc(b,a,None)
         x=np.clip(np.rint(xx*scale).astype(int),0,size[0]-1)
@@ -67,11 +75,14 @@ class MultiViewConfirmation:
                 inside=positive&(u>=0)&(u<w)&(v>=0)&(v<h)
                 old_v,old_u=np.clip(v,0,h-1),np.clip(u,0,w-1)
                 old_z=previous.points[old_v,old_u,2]
-                # Two disparity pixels plus a small floor for pose/pixel rounding.
-                tolerance=np.maximum(.002 if self.required>1 else .003,
-                    (1 if self.required>1 else 2)*safe_z**2/(self.K[0,0]*self.baseline))
-                tolerance=np.minimum(tolerance,np.maximum(.002 if self.required>1 else .003,
-                    (.01 if self.required>1 else .02)*safe_z))
+                if self.depth_tolerance:
+                    tolerance=self.depth_tolerance(safe_z)
+                else:
+                    # Two disparity pixels plus a small floor for pose/pixel rounding.
+                    tolerance=np.maximum(.002 if self.required>1 else .003,
+                        (1 if self.required>1 else 2)*safe_z**2/(self.K[0,0]*self.baseline))
+                    tolerance=np.minimum(tolerance,np.maximum(.002 if self.required>1 else .003,
+                        (.01 if self.required>1 else .02)*safe_z))
                 consistent=inside&previous.valid[old_v,old_u]&np.isfinite(old_z)&(np.abs(old_z-z)<=tolerance)
                 if self.image_motion:
                     consistent &= self.motion_agreement(frame,previous,xx,yy,u,v)

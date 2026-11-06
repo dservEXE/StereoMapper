@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from .surfaces import plane_estimates
-from .ghost_filter import supported_disparity
+from .ghost_filter import supported_disparity, tracking_gray  # noqa: F401
 
 
 @dataclass
@@ -25,6 +25,8 @@ class DepthFrame:
     alignment_error: float | None = None
     quality_warning: str | None = None
     estimated_points: np.ndarray | None = None
+    # Grey view aligned with the depth, when it differs from the colour view in `left`.
+    tracking: np.ndarray | None = None
 
 
 @lru_cache(maxsize=12)

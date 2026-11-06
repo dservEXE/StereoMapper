@@ -2,6 +2,7 @@
 import tkinter as tk
 from tkinter import ttk
 from .help_ui import help_icon
+from .maixsense import TOF_LABEL
 from .presets import PRESETS
 from .ui import apply_theme, note, ScrolledFrame, Foldout, quick_guide, BG
 
@@ -70,9 +71,9 @@ def build(app):
     ttk.Label(camera,text="Тип подключения").pack(anchor="w",pady=(0,3))
     mode_row=ttk.Frame(camera); mode_row.pack(fill="x",pady=(0,7))
     help_icon(mode_row,"mode").pack(side="right",padx=(7,0))
-    mode=ttk.Combobox(mode_row,textvariable=app.vars["mode"],values=("Две камеры","Два вида рядом"),state="readonly")
+    mode=ttk.Combobox(mode_row,textvariable=app.vars["mode"],values=("Две камеры","Два вида рядом",TOF_LABEL),state="readonly")
     mode.pack(side="left",fill="x",expand=True); app.settings_controls.append((mode,"readonly"))
-    fields(camera,[("Левая камера","left"),("Правая камера","right")])
+    fields(camera,[("Левая камера","left"),("Правая камера","right"),("Адрес MaixSense","tof_address")])
     ttk.Label(camera,text="Что вы снимаете?",style="Section.TLabel").pack(anchor="w",pady=(10,4))
     preset=ttk.Combobox(camera,textvariable=app.vars["profile"],values=("Свои настройки",*PRESETS),state="readonly")
     preset.pack(fill="x"); preset.bind("<<ComboboxSelected>>",lambda e:app.apply_preset())

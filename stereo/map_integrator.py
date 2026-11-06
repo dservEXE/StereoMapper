@@ -55,6 +55,8 @@ class MapIntegrator(Thread):
                             self.waiting_confirmation+=1
                             self.status="Положение найдено; ожидаю повторное подтверждение поверхности"
                             continue
+                    if getattr(self.odometry,"still",False) and self.integrated:
+                        continue
                     self.cloud.add(accepted,pose)
                     if frame.estimated_points is not None:
                         estimated=SimpleNamespace(points=frame.estimated_points,
