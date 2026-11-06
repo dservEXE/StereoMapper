@@ -9,6 +9,9 @@ from .surfaces import plane_estimates
 from .ghost_filter import supported_disparity, tracking_gray  # noqa: F401
 
 
+ALIGNMENT_INTERVAL = 8
+
+
 @dataclass
 class DepthFrame:
     left: np.ndarray
@@ -153,6 +156,11 @@ class DepthEngine:
                  processing_width=None, temporal=True, near_priority=False, wide_view=False, detail=False,
                  estimate_surfaces=True, near_minimum=None, acceleration="cpu", parallel=False,ghost_filter="normal"):
         self.source_calibration = calibration
+        # For a subject metres away, as in weighing: skips the near search of the closest
+        # surfaces, four of six matching runs per frame, and checks alignment less often.
+        self.speed_priority = False
+        self.frames_since_alignment = 0
+        self.last_vertical = None
         size = calibration.size
         if processing_width and size[0] > processing_width:
             size = (processing_width, round(size[1] * processing_width / size[0]))
@@ -316,7 +324,11 @@ class DepthEngine:
         b = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
         self.last_timings["rectify_ms"] = (time.perf_counter()-started)*1000
         stage = time.perf_counter()
-        vertical = alignment_error(a, b, self.alignment_detector)
+        self.frames_since_alignment += 1
+        if not self.speed_priority or self.frames_since_alignment >= ALIGNMENT_INTERVAL:
+            self.frames_since_alignment = 0
+            self.last_vertical = alignment_error(a, b, self.alignment_detector)
+        vertical = self.last_vertical
         self.last_timings["alignment_ms"] = (time.perf_counter()-stage)*1000
         if vertical is not None and vertical > max(.9, a.shape[1] / 640 * 1.2):
             self.previous = None
@@ -347,7 +359,7 @@ class DepthEngine:
             disparity = self.wls.filter(raw_left, left, disparity_map_right=raw_right,**options).astype(np.float32) / 16.0
             valid &= self.wls.getConfidenceMap() >= (180 if self.ghost_filter=='strict' else 128)
             valid &= consistency_mask(disparity, reverse,self.lr_tolerance)
-        for start, number, matcher, reverse_matcher, wls, roi in self.near_passes:
+        for start, number, matcher, reverse_matcher, wls, roi in () if self.speed_priority else self.near_passes:
             near_a, near_b = a[:, start:], b[:, :a.shape[1] - start]
             candidate_raw,reverse_raw = self.match_pair(matcher,reverse_matcher,near_a,near_b)
             candidate = candidate_raw.astype(np.float32) / 16.0

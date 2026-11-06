@@ -17,13 +17,15 @@ import cv2
 import numpy as np
 
 from stereo.app import StereoApp
+from stereo.calibration import Calibration
 from stereo.camera import CameraConfig
-from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, HANDS_FEET_FACTOR, KEYPOINT_COUNT,
+from stereo.depth import ALIGNMENT_INTERVAL, DepthEngine
+from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, fill_holes, HANDS_FEET_FACTOR, KEYPOINT_COUNT,
                                  L_ANKLE, L_ELBOW, L_HIP, L_KNEE, L_SHOULDER, L_WRIST, MIN_SAMPLES, PersonObservation,
-                                 R_ANKLE, R_ELBOW, R_HIP, R_KNEE, R_SHOULDER, R_WRIST, SLICES, body_slices, measure_person,
-                                 outline_depth, part_width, rescaled, slice_profile, slices_volume, span_width)
+                                 R_ANKLE, R_ELBOW, R_HIP, R_KNEE, R_SHOULDER, R_WRIST, SLICES, body_slices, measure_person, outline_height,
+                                 outline_depth, outline_disparity, part_width, rescaled, slice_profile, slices_volume, span_width)
 from stereo.people_detection import (DETECTOR, DOWNLOAD_SIZE_MB, SEGMENTER, SOURCES, crop_matrix, decode_heatmaps, download_models,
-                                     model_path, models_ready, peak, pose_crop)
+                                     model_path, models_ready, outline_hints, peak, pose_crop)
 from stereo.people_tracking import PersonTracker, box_iou
 from stereo.gpu_pack import WHEEL_SHA256, WHEEL_URL, gpu_pack_ready, install_gpu_pack
 from stereo.weighing import WeighingSession
@@ -36,7 +38,8 @@ TORSO_WIDTH, TORSO_DEPTH, TORSO_LENGTH = .40, .25, .52
 ARM_LENGTH, ARM_WIDTH = .55, .09
 LEG_LENGTH, LEG_WIDTH = .90, .15
 HEAD_WIDTH, HEAD_LENGTH = .17, .25
-TRUE_HEIGHT = (HEAD_LENGTH + TORSO_LENGTH + LEG_LENGTH) / (1 - .039)
+# The drawn legs end in round caps of half their width, which belong to the outline.
+TRUE_HEIGHT = HEAD_LENGTH + TORSO_LENGTH + LEG_LENGTH + LEG_WIDTH / 2
 
 
 def true_mass() -> float:
@@ -199,6 +202,135 @@ class MeasureTests(unittest.TestCase):
         sample = measure_person(points, valid, K, observation._replace(keypoint_scores=scores), body_outline())
         self.assertIsNone(sample.height)
         self.assertNotIn("shin_l", sample.widths)
+
+
+class OutlineDistanceTests(unittest.TestCase):
+    @staticmethod
+    def body(shift=0):
+        mask = np.zeros((480, 640), bool)
+        mask[60:420, 280 - shift:360 - shift] = True
+        mask[100:130, 200 - shift:440 - shift] = True
+        return mask
+
+    def test_shift_between_outlines_is_found_regardless_of_shape(self):
+        self.assertEqual(outline_disparity(self.body(), self.body(12)), 12.)
+
+    def test_half_pixel_shift_is_resolved(self):
+        left, right = self.body(), self.body(12)
+        right[:, :] = False
+        right[60:420, 268:347] = True  # one edge moved by a pixel: 12 and 13
+        self.assertAlmostEqual(outline_disparity(left, right), 12.5, places=3)
+
+    def test_disagreeing_or_empty_outlines_are_rejected(self):
+        empty = np.zeros((480, 640), bool)
+        self.assertIsNone(outline_disparity(self.body(), empty))
+        other = np.zeros((480, 640), bool)
+        other[60:420, 100:120] = True
+        wide = np.zeros((480, 640), bool)
+        wide[60:240, 280:360] = True
+        wide[240:420, 400:600] = True
+        self.assertIsNone(outline_disparity(wide, other))
+        self.assertIsNone(outline_disparity(self.body(), self.body()))
+
+    def test_body_parts_at_disagreeing_distances_reject_the_frame(self):
+        left = np.zeros((480, 640), bool)
+        right = np.zeros((480, 640), bool)
+        left[60:420, 280:360] = True
+        right[60:300, 268:348] = True
+        right[300:420, 250:330] = True  # legs traced 18 px further over than the upper body's 12
+        self.assertIsNone(outline_disparity(left, right))
+
+    def test_small_differences_between_body_parts_are_tolerated(self):
+        left = np.zeros((480, 640), bool)
+        right = np.zeros((480, 640), bool)
+        left[60:420, 280:360] = True
+        right[60:300, 268:348] = True
+        right[300:420, 267:347] = True
+        self.assertEqual(outline_disparity(left, right), 12.)
+
+    def test_given_distance_replaces_the_depth_map(self):
+        points, valid, observation, *_ = person_scene()
+        sample = measure_person(points, valid, K, observation, body_outline(), depth=3.)
+        self.assertEqual(sample.depth, 3.)
+        self.assertAlmostEqual(sample.height, TRUE_HEIGHT * 3 / 2.5, delta=.05)
+
+    def test_session_takes_the_distance_from_both_outlines(self):
+        frame = FakeFrame()
+        frame.right = np.roll(frame.left, -18, axis=1)
+        calls = []
+
+        class TwoViews(FakeDetector):
+            def outline(self, image, observation):
+                calls.append(observation)
+                return frame.outline if image is frame.left else np.roll(frame.outline, -18, axis=1)
+        session = WeighingSession(lambda status: None)
+        distance = session.outline_distance(TwoViews(), frame, K, .06, frame.outline, frame.observation)
+        self.assertAlmostEqual(distance, 600 * .06 / 18, places=3)
+
+    def test_prompt_for_the_second_view_moves_with_the_expected_shift(self):
+        frame = FakeFrame()
+        frame.right = frame.left
+        seen = []
+
+        class Recorder(FakeDetector):
+            def outline(self, image, observation):
+                seen.append(observation)
+                return None
+        session = WeighingSession(lambda status: None)
+        self.assertIsNone(session.outline_distance(Recorder(), frame, K, .06, frame.outline, frame.observation))
+        expected = 600 * .06 / 2.5
+        self.assertAlmostEqual(frame.observation.box[0] - seen[0].box[0], expected, delta=.5)
+
+    def test_without_a_baseline_the_depth_map_is_used(self):
+        frame = FakeFrame()
+        frame.right = frame.left
+        session = WeighingSession(lambda status: None)
+        self.assertIsNone(session.outline_distance(FakeDetector(), frame, K, None, frame.outline, frame.observation))
+
+
+class HeightTests(unittest.TestCase):
+    def test_height_runs_from_crown_to_soles_along_the_body(self):
+        mask = np.zeros((480, 640), bool)
+        mask[50:430, 300:340] = True
+        self.assertAlmostEqual(outline_height(mask, (0., 1.)), 379, delta=2)
+
+    def test_tilted_body_is_measured_along_its_own_axis(self):
+        mask = np.zeros((480, 640), np.uint8)
+        cv2.line(mask, (250, 60), (390, 420), 1, 20)
+        direction = np.array((140., 360.)) / np.hypot(140, 360)
+        self.assertAlmostEqual(outline_height(mask > 0, direction), np.hypot(140, 360), delta=25)
+
+    def test_person_cut_off_by_the_frame_has_no_height(self):
+        mask = np.zeros((480, 640), bool)
+        mask[100:480, 300:340] = True
+        self.assertIsNone(outline_height(mask, (0., 1.)))
+        mask = np.zeros((480, 640), bool)
+        mask[0:300, 300:340] = True
+        self.assertIsNone(outline_height(mask, (0., 1.)))
+
+    def test_outstretched_arms_do_not_change_the_height(self):
+        mask = np.zeros((480, 640), bool)
+        mask[50:430, 300:340] = True
+        plain = outline_height(mask, (0., 1.))
+        mask[120:140, 100:540] = True
+        self.assertAlmostEqual(outline_height(mask, (0., 1.)), plain, delta=3)
+
+
+class LimbDepthTests(unittest.TestCase):
+    def test_arm_overlapping_the_body_from_the_side_cannot_inflate_the_volume(self):
+        plain = BodyAccumulator()
+        overlapped = BodyAccumulator()
+        for index in range(60):
+            yaw = 90 * abs(math.sin(index / 60 * math.pi * 2))
+            sample = sample_at(yaw=yaw)
+            plain.add(sample)
+            widths = dict(sample.widths)
+            if yaw >= 60:
+                for key in ("upper_arm_l", "upper_arm_r", "forearm_l", "forearm_r"):
+                    widths[key] = .30
+            overlapped.add(sample._replace(widths=widths))
+        # The cap allows 30% on about 7 litres of arms; uncapped this would add about 16 litres.
+        self.assertLess(overlapped.estimate().volume_l - plain.estimate().volume_l, 3.)
 
 
 class SliceTests(unittest.TestCase):
@@ -493,6 +625,32 @@ class PoseGeometryTests(unittest.TestCase):
         self.assertEqual(peak(np.array((3., 2., 1.)), 0), 0.)
 
 
+class OutlineHintTests(unittest.TestCase):
+    def test_hints_cover_the_clothes_between_the_joints(self):
+        _, _, observation, *_ = person_scene()
+        hints = np.array(outline_hints(observation))
+        kp = observation.keypoints
+        neck, pelvis = (kp[L_SHOULDER] + kp[R_SHOULDER]) / 2, (kp[L_HIP] + kp[R_HIP]) / 2
+        chest = neck + (pelvis - neck) * .4
+        self.assertLess(float(np.min(np.linalg.norm(hints - chest, axis=1))), 1.)
+        thigh = (kp[L_HIP] + kp[L_KNEE]) / 2
+        self.assertLess(float(np.min(np.linalg.norm(hints - thigh, axis=1))), 1.)
+
+    def test_unseen_joints_add_no_invented_points(self):
+        _, _, observation, *_ = person_scene()
+        none = observation._replace(keypoint_scores=np.zeros(KEYPOINT_COUNT, np.float32))
+        self.assertEqual(outline_hints(none), [])
+
+    def test_a_top_missed_inside_the_outline_is_filled(self):
+        mask = np.zeros((100, 100), bool)
+        mask[10:90, 30:70] = True
+        mask[30:60, 40:60] = False
+        filled = fill_holes(mask)
+        self.assertTrue(filled[45, 50])
+        self.assertFalse(filled[45, 10])
+        self.assertEqual(int(filled.sum()), 80 * 40)
+
+
 class FakeFrame:
     def __init__(self, **kwargs):
         self.points, self.valid, self.observation, _, self.left = person_scene(**kwargs)
@@ -605,8 +763,8 @@ class SessionTests(unittest.TestCase):
         session = WeighingSession(lambda status: None)
         session.measured_at = {1: 5., 2: 1., 3: 9.}
         frame = FakeFrame()
-        session.request_outline(frame, K, [(1, "a"), (2, "b"), (3, "c")])
-        self.assertEqual(session.outlines.get()[2], 2)
+        session.request_outline(frame, K, None, [(1, "a"), (2, "b"), (3, "c")])
+        self.assertEqual(session.outlines.get()[3], 2)
 
     def test_newest_frame_replaces_a_waiting_one(self):
         session = WeighingSession(lambda status: FakeDetector())
@@ -650,6 +808,57 @@ def _single(frame):
     detector = FakeDetector()
     detector.current = frame.observation
     return detector
+
+
+class SpeedPriorityTests(unittest.TestCase):
+    def engine(self):
+        K1 = np.array([[500., 0, 320], [0, 500., 240], [0, 0, 1]])
+        size = (640, 480)
+        R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(K1, np.zeros(5), K1, np.zeros(5), size, np.eye(3),
+                                                          np.array((-.06, 0., 0.)), alpha=0)
+        calibration = Calibration(size, K1, np.zeros(5), K1, np.zeros(5), np.eye(3), np.array((-.06, 0., 0.)),
+                                  R1, R2, P1, P2, Q, np.array(roi1), np.array(roi2), .1, .1, CameraConfig().signature())
+        return DepthEngine(calibration, 8., 64, "fast", None, False, True, False, estimate_surfaces=False,
+                           acceleration="cpu")
+
+    def pair(self):
+        left = cv2.GaussianBlur(np.random.default_rng(1).integers(0, 255, (480, 640, 3), np.uint8), (3, 3), 0)
+        return left, np.roll(left, -10, axis=1)
+
+    def test_it_skips_the_near_search_and_most_alignment_checks_but_only_when_asked(self):
+        engine = self.engine()
+        self.addCleanup(engine.close)
+        left, right = self.pair()
+        with patch("stereo.depth.alignment_error", return_value=.1) as alignment,                 patch.object(engine, "match_pair", wraps=engine.match_pair) as matching:
+            engine.compute(left, right)
+            normal = matching.call_count
+            self.assertEqual(alignment.call_count, 1)
+            matching.reset_mock()
+            alignment.reset_mock()
+            engine.speed_priority = True
+            for _ in range(ALIGNMENT_INTERVAL):
+                engine.compute(left, right)
+            self.assertEqual(matching.call_count, ALIGNMENT_INTERVAL)
+            self.assertEqual(alignment.call_count, 1)
+            self.assertGreater(normal, 1)
+            matching.reset_mock()
+            engine.speed_priority = False
+            engine.compute(left, right)
+            self.assertEqual(matching.call_count, normal)
+
+    def test_alignment_warning_still_comes_through_at_speed(self):
+        engine = self.engine()
+        self.addCleanup(engine.close)
+        left, right = self.pair()
+        engine.speed_priority = True
+        engine.frames_since_alignment = ALIGNMENT_INTERVAL
+        with patch("stereo.depth.alignment_error", return_value=9.):
+            self.assertIn("расходится", engine.compute(left, right).quality_warning)
+
+    def test_map_and_scan_keep_the_full_search_by_default(self):
+        engine = self.engine()
+        self.addCleanup(engine.close)
+        self.assertFalse(engine.speed_priority)
 
 
 class WorkerCommandTests(unittest.TestCase):

@@ -607,11 +607,12 @@ class CameraWorker(Thread):
                         self.finish_scan(f"Сбор прерван: {error}")
                 elif self.engine and self.depth_enabled and not self.calibration_busy:
                     depth_started = time.perf_counter()
+                    self.engine.speed_priority = self.weighing is not None
                     self.frame = self.engine.compute(*self.raw)
                     self.frame_raw = self.raw
                     self.depth_frames += 1
                     if self.weighing:
-                        self.weighing.submit(self.frame, self.engine.calibration.P1[:, :3])
+                        self.weighing.submit(self.frame, self.engine.calibration.P1[:, :3], self.calibration.baseline)
                     did_compute = True
                     depth_ms = (time.perf_counter() - depth_started) * 1000
                     local = self.frame.points[::4, ::4].reshape(-1, 3)

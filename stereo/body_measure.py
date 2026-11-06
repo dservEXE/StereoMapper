@@ -26,6 +26,12 @@ SKELETON = ((L_SHOULDER, R_SHOULDER), (L_HIP, R_HIP), (L_SHOULDER, L_HIP), (R_SH
 
 MIN_KEYPOINT_SCORE = .35
 MAX_GAP_PX = 2
+MIN_OUTLINE_ROWS = 40
+MIN_OUTLINE_DISPARITY = 1.
+# Median distance of a row from the overall shift; larger means the two outlines disagree.
+MAX_OUTLINE_SPREAD = 6.
+OUTLINE_BANDS = 3
+MAX_BAND_DISAGREEMENT = 3.
 DEPTH_EROSION_PX = 9
 DEPTH_BIN_M = .04
 MIN_DEPTH_PIXELS = 30
@@ -38,8 +44,11 @@ SAMPLES_ALONG_PART = 7
 # Part of a limb next to a joint is widened by the neighbouring part, so sample its middle.
 PART_START, PART_END = .25, .75
 
-# Ankle height is about 3.9% of stature (Drillis and Contini, 1966).
-ANKLE_HEIGHT_FRACTION = .039
+# A real person measured 158 cm: outline height at the outline distance gave 158.3 cm, while the
+# ankle joint plus the usual 3.9% of stature gave 150, as feet reach lower in a downward view.
+FRAME_MARGIN_PX = 2
+# A limb is about round. Seen from the side it overlaps the body, which must not widen it.
+MAX_LIMB_DEPTH_RATIO = 1.3
 BODY_DENSITY_KG_M3 = 1020.
 # Hands and feet are about 4% of body mass (Winter, Biomechanics) and are not measured here.
 HANDS_FEET_FACTOR = 1.04
@@ -106,6 +115,14 @@ class WeightEstimate:
     slices_side_m: tuple = ()
 
 
+def fill_holes(mask) -> np.ndarray:
+    """Everything enclosed by the outline is body: a person has no holes inside."""
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros(mask.shape, np.uint8)
+    cv2.drawContours(filled, contours, -1, 1, cv2.FILLED)
+    return filled > 0
+
+
 def run_length(mask, x, y, dx, dy, limit_px) -> float:
     """How far a straight walk stays on the outline, ignoring tiny gaps."""
     height, width = mask.shape
@@ -121,6 +138,17 @@ def run_length(mask, x, y, dx, dy, limit_px) -> float:
             if gap > MAX_GAP_PX:
                 break
     return reached
+
+
+def outline_height(mask, direction) -> float | None:
+    """Pixels from the crown to the soles along the body, or None if the frame cuts the person off."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys) or ys.min() < FRAME_MARGIN_PX or ys.max() >= mask.shape[0] - FRAME_MARGIN_PX:
+        return None
+    along = xs * direction[0] + ys * direction[1]
+    # Percentiles keep a stray pixel from setting the height; a person has thousands.
+    low, high = np.percentile(along, (.1, 99.9))
+    return float(high - low)
 
 
 def body_slices(mask, neck, ankle, reach_px, scale) -> tuple:
@@ -207,8 +235,34 @@ def outline_depth(z, valid, mask) -> float | None:
     return float(np.median(near))
 
 
-def measure_person(points, valid, K, observation, mask) -> BodySample | None:
-    """One frame's measurements from the body's outline, or None if the torso is not reliably seen."""
+def outline_disparity(left, right) -> float | None:
+    """Shift of a body between the two rectified views, from its outline in each.
+
+    Stereo matching fails on plain skin and clothing, where it has nothing to compare; here
+    one pixel of disparity is about 24 cm at 3 m. The outline's edges are sharp whatever the
+    surface, and hundreds of rows give a median far finer than a pixel.
+    """
+    rows = left.any(axis=1) & right.any(axis=1)
+    if rows.sum() < MIN_OUTLINE_ROWS:
+        return None
+    a, b = left[rows], right[rows]
+    width = left.shape[1]
+    starts = np.argmax(a, axis=1) - np.argmax(b, axis=1)
+    ends = (width - 1 - np.argmax(a[:, ::-1], axis=1)) - (width - 1 - np.argmax(b[:, ::-1], axis=1))
+    shifts = (starts + ends) / 2
+    disparity = float(np.median(shifts))
+    if disparity < MIN_OUTLINE_DISPARITY or float(np.median(np.abs(shifts - disparity))) > MAX_OUTLINE_SPREAD:
+        return None
+    # Upper body, middle and legs stand at one distance: if they disagree, an outline is wrong.
+    bands = [float(np.median(band)) for band in np.array_split(shifts, OUTLINE_BANDS)]
+    return disparity if max(bands) - min(bands) <= MAX_BAND_DISAGREEMENT else None
+
+
+def measure_person(points, valid, K, observation, mask, depth=None) -> BodySample | None:
+    """One frame's measurements from the body's outline, or None if the torso is not reliably seen.
+
+    `depth` is a better distance when the caller has one; otherwise it comes from the depth map.
+    """
     z = np.nan_to_num(points[:, :, 2]).astype(np.float32)
     valid = valid & (z > 0)
     kp, scores = observation.keypoints, observation.keypoint_scores
@@ -221,7 +275,7 @@ def measure_person(points, valid, K, observation, mask) -> BodySample | None:
     torso_px = float(np.linalg.norm(torso_axis))
     if torso_px < 8:
         return None
-    body_depth = outline_depth(z, valid, mask)
+    body_depth = depth if depth is not None else outline_depth(z, valid, mask)
     if body_depth is None:
         return None
     focal = float(K[0, 0] + K[1, 1]) / 2
@@ -243,14 +297,12 @@ def measure_person(points, valid, K, observation, mask) -> BodySample | None:
     head_px = run_length(mask, *neck, ux, uy, torso_px)
     height = None
     if head_px >= 3:
-        top = neck + np.array((ux, uy)) * head_px
         lengths["head"] = head_px * scale
         center = neck + np.array((ux, uy)) * head_px * .65
         widths["head"] = (run_length(mask, *center, -uy, ux, head_px) + run_length(mask, *center, uy, -ux, head_px) + 1) * scale
-        ankles = [kp[i] for i in (L_ANKLE, R_ANKLE) if seen[i]]
-        if ankles:
-            ankle = ray_point(*np.mean(ankles, axis=0), body_depth, K)
-            height = float(np.linalg.norm(ray_point(*top, body_depth, K) - ankle)) / (1 - ANKLE_HEIGHT_FRACTION)
+        if any(seen[i] for i in (L_ANKLE, R_ANKLE)):
+            pixels = outline_height(mask, (-ux, -uy))
+            height = pixels * scale if pixels else None
     shoulder_span = float(np.linalg.norm(kp[L_SHOULDER] - kp[R_SHOULDER])) * scale
     slices, split, slice_length = (), (), None
     visible_ankles = [kp[i] for i in (L_ANKLE, R_ANKLE) if seen[i]]
@@ -390,6 +442,8 @@ class BodyAccumulator:
         for part in ASSUMED_DEPTH_RATIO:
             if part in widths:
                 depth = side_widths.get(part, widths[part] * ASSUMED_DEPTH_RATIO[part])
+                if part != "head":
+                    depth = min(depth, widths[part] * MAX_LIMB_DEPTH_RATIO)
                 area = math.pi / 4 * widths[part] * depth
                 volume += area * lengths[part] * (2 / 3 if part == "head" else 1) * LIMB_COUNT[part]
         mass = volume * BODY_DENSITY_KG_M3 * HANDS_FEET_FACTOR

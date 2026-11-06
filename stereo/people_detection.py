@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .body_measure import KEYPOINT_COUNT, MIN_KEYPOINT_SCORE, PersonObservation
+from .body_measure import KEYPOINT_COUNT, MIN_KEYPOINT_SCORE, PersonObservation, fill_holes
 
 DOWNLOAD_SIZE_MB = 252
 DETECTION_THRESHOLD = .5
@@ -142,6 +142,24 @@ def decode_heatmaps(heatmaps, crop) -> tuple:
     return keypoints, scores
 
 
+def outline_hints(observation) -> list:
+    """Points known to be on the body, including across the clothes between the joints.
+
+    With hints only on joints the outline model took a dark top for a separate object, and
+    the chest went missing from the volume.
+    """
+    points, scores = observation.keypoints, observation.keypoint_scores
+    seen = scores >= MIN_KEYPOINT_SCORE
+    hints = [points[i] for i in OUTLINE_HINTS if seen[i]]
+    if seen[5] and seen[6] and seen[11] and seen[12]:
+        neck, pelvis = (points[5] + points[6]) / 2, (points[11] + points[12]) / 2
+        hints += [neck + (pelvis - neck) * share for share in (.2, .4, .6, .8)]
+    for hip, knee in ((11, 13), (12, 14)):
+        if seen[hip] and seen[knee]:
+            hints.append((points[hip] + points[knee]) / 2)
+    return [[float(x), float(y)] for x, y in hints]
+
+
 class PersonDetector:
     """RT-DETR finds people, ViTPose places 17 joints, SlimSAM traces the outline."""
 
@@ -174,8 +192,7 @@ class PersonDetector:
 
     def outline(self, bgr, observation) -> np.ndarray | None:
         """Exact body pixels for one person, from their box and joints."""
-        hints = [[float(v) for v in observation.keypoints[i]] for i in OUTLINE_HINTS
-                 if observation.keypoint_scores[i] >= MIN_KEYPOINT_SCORE]
+        hints = outline_hints(observation)
         if len(hints) < 2:
             return None
         image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
@@ -188,7 +205,7 @@ class PersonDetector:
                                     input_labels=inputs["input_labels"].to(self.device), multimask_output=False)
         masks = self.segment_images.post_process_masks(output.pred_masks.cpu(), inputs["original_sizes"],
                                                        inputs["reshaped_input_sizes"])
-        return masks[0][0, 0].numpy().astype(bool)
+        return fill_holes(masks[0][0, 0].numpy().astype(bool))
 
     def detect(self, bgr) -> list:
         height, width = bgr.shape[:2]

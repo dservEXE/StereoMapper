@@ -7,8 +7,12 @@ import time
 
 import numpy as np
 
-from .body_measure import BodyAccumulator, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, measure_person
+from .body_measure import (BodyAccumulator, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, measure_person, outline_depth,
+                           outline_disparity)
 from .people_tracking import PersonTracker
+
+
+DEFAULT_DISTANCE_M = 3.
 
 
 @dataclass(frozen=True)
@@ -62,20 +66,37 @@ class WeighingSession(Thread):
         self.measured_at = {}
         self.outlines_seen = {}
 
-    def submit(self, frame, K) -> None:
+    def submit(self, frame, K, baseline=None) -> None:
+        """Newest frame for analysis. A baseline in metres enables distance from both outlines."""
         try:
-            self.frames.put_nowait((frame, K))
+            self.frames.put_nowait((frame, K, baseline))
         except Full:
             try:
                 self.frames.get_nowait()
             except Empty:
                 pass
-            self.frames.put_nowait((frame, K))
+            self.frames.put_nowait((frame, K, baseline))
 
     def reset(self) -> None:
         self.reset_requested = True
 
-    def analyse(self, detector, frame, K, fps) -> WeighingState:
+    def outline_distance(self, detector, frame, K, baseline, mask, observation) -> float | None:
+        """Distance from the same body traced in the second camera, or None to use the depth map."""
+        right = getattr(frame, "right", None)
+        if not baseline or right is None or mask is None:
+            return None
+        focal = float(K[0, 0] + K[1, 1]) / 2
+        z = np.nan_to_num(frame.points[:, :, 2]).astype(np.float32)
+        rough = outline_depth(z, frame.valid & (z > 0), mask) or DEFAULT_DISTANCE_M
+        shift = focal * baseline / rough
+        x0, y0, x1, y1 = observation.box
+        moved = observation._replace(box=(x0 - shift, y0, x1 - shift, y1),
+                                     keypoints=observation.keypoints - np.array((shift, 0.), np.float32))
+        other = detector.outline(right, moved)
+        disparity = outline_disparity(mask, other) if other is not None else None
+        return focal * baseline / disparity if disparity else None
+
+    def analyse(self, detector, frame, K, fps, baseline=None) -> WeighingState:
         now = time.perf_counter()
         observations = detector.detect(frame.left)
         depths = [torso_depth(frame, observation) for observation in observations]
@@ -87,31 +108,34 @@ class WeighingSession(Thread):
             views.append(PersonView(track.track_id, track.color, observation.box, observation.keypoints,
                                     observation.keypoint_scores, depths[index], estimate, outline))
             waiting.append((track.track_id, observation))
-        self.request_outline(frame, K, waiting)
+        self.request_outline(frame, K, baseline, waiting)
         people = tuple(sorted(views, key=lambda view: view.track_id))
         with self.lock:
             known = {track_id: body.estimate() for track_id, body in self.bodies.items()}
         message = f"В кадре людей: {len(people)}" if people else "Людей в кадре не видно"
+        if getattr(detector, "device", None):
+            message += " · видеокарта" if detector.device == "cuda" else " · процессор"
         return WeighingState(people, known, fps, message, frame.left)
 
-    def request_outline(self, frame, K, waiting) -> None:
+    def request_outline(self, frame, K, baseline, waiting) -> None:
         """Hand the least recently measured person to the slower outline thread, if it is free."""
         if not waiting or self.outlines.full():
             return
         track_id, observation = min(waiting, key=lambda item: self.measured_at.get(item[0], 0.))
         self.measured_at[track_id] = time.perf_counter()
-        self.outlines.put((frame, K, track_id, observation))
+        self.outlines.put((frame, K, baseline, track_id, observation))
 
     def measure_loop(self, detector) -> None:
         """Outlines take about a second each, so labels must not wait for them."""
         while not self.stop_event.is_set():
             try:
-                frame, K, track_id, observation = self.outlines.get(timeout=.1)
+                frame, K, baseline, track_id, observation = self.outlines.get(timeout=.1)
             except Empty:
                 continue
             try:
                 mask = detector.outline(frame.left, observation)
-                sample = measure_person(frame.points, frame.valid, K, observation, mask)
+                depth = self.outline_distance(detector, frame, K, baseline, mask, observation)
+                sample = measure_person(frame.points, frame.valid, K, observation, mask, depth)
             except Exception as error:
                 self.fail(f"Ошибка измерения: {error}")
                 return
@@ -134,7 +158,7 @@ class WeighingSession(Thread):
         fps, previous = 0., None
         while not self.stop_event.is_set():
             try:
-                frame, K = self.frames.get(timeout=.1)
+                frame, K, baseline = self.frames.get(timeout=.1)
             except Empty:
                 continue
             if self.reset_requested:
@@ -143,7 +167,7 @@ class WeighingSession(Thread):
                     self.tracker, self.bodies, self.measured_at = PersonTracker(), {}, {}
                     self.outlines_seen = {}
             try:
-                state = self.analyse(detector, frame, K, fps)
+                state = self.analyse(detector, frame, K, fps, baseline)
             except Exception as error:
                 self.fail(f"Ошибка анализа кадра: {error}")
                 break
