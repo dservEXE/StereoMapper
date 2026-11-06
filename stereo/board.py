@@ -8,6 +8,7 @@ from tkinter import ttk
 import numpy as np
 from PIL import Image
 
+from . import ui
 from .calibration_ui import CalibrationShortcuts, StereoPreview
 
 
@@ -47,6 +48,7 @@ class BoardWindow:
                  status_var=None, shortcuts=None):
         self.directory, self.on_apply, self.on_capture = Path(directory), on_apply, on_capture
         self.window = tk.Toplevel(parent)
+        ui.style_window(self.window)
         self.window.title("Экранная калибровочная доска")
         self.window.geometry("1180x900")
         self.window.minsize(760, 600)
@@ -63,35 +65,33 @@ class BoardWindow:
         self.scale_verified = False
         self.reference_pixels = round(100 * self.ppm)
         self.load_scale()
-        self.controls = ttk.Frame(self.window, padding=10)
+        self.controls = ttk.Frame(self.window, padding=(ui.SPACE_L, ui.SPACE_M))
         self.controls.pack(fill="x")
         row = ttk.Frame(self.controls)
         row.pack(fill="x")
         for label, variable in (("Углов по горизонтали", self.columns), ("по вертикали", self.rows),
                                  ("Клетка, мм", self.square)):
-            ttk.Label(row, text=label).pack(side="left", padx=(0, 4))
-            ttk.Entry(row, textvariable=variable, width=7).pack(side="left", padx=(0, 12))
-        buttons = ttk.Frame(self.controls)
-        buttons.pack(fill="x", pady=(6, 0))
-        ttk.Button(buttons, text="Построить", command=self.generate).pack(side="left", padx=3)
-        ttk.Button(buttons, text="Вписать в экран", command=self.fit).pack(side="left", padx=3)
-        ttk.Button(buttons, text="Полный экран · F11", command=self.toggle_fullscreen).pack(side="left", padx=3)
+            ttk.Label(row, text=label).pack(side="left", padx=(0, ui.SPACE_S))
+            ttk.Entry(row, textvariable=variable, width=7).pack(side="left", padx=(0, ui.SPACE_L))
+        ttk.Button(row, text="Построить", command=self.generate).pack(side="left", padx=(0, ui.SPACE_S))
+        ttk.Button(row, text="Вписать в экран", command=self.fit).pack(side="left", padx=(0, ui.SPACE_S))
+        ttk.Button(row, text="Полный экран · F11", command=self.toggle_fullscreen).pack(side="left")
         scale = ttk.Frame(self.controls)
-        scale.pack(fill="x", pady=8)
+        scale.pack(fill="x", pady=ui.SPACE_S)
         ttk.Label(scale, text="Реальная длина контрольной линии, мм:").pack(side="left")
-        ttk.Entry(scale, textvariable=self.measured, width=8).pack(side="left", padx=6)
-        ttk.Button(scale, text="Уточнить масштаб по линейке", command=self.calibrate_scale).pack(side="left", padx=3)
+        ttk.Entry(scale, textvariable=self.measured, width=8).pack(side="left", padx=ui.SPACE_S)
+        ttk.Button(scale, text="Уточнить масштаб по линейке", command=self.calibrate_scale).pack(side="left")
         action = ttk.Frame(self.controls)
         action.pack(fill="x")
-        ttk.Button(action, text="Применить для калибровки", command=self.apply).pack(side="left", padx=3)
-        ttk.Button(action, text="Сохранить PNG для печати", command=self.save_png).pack(side="left", padx=3)
+        ttk.Button(action, text="Применить для калибровки", command=self.apply).pack(side="left", padx=(0, ui.SPACE_S))
+        ttk.Button(action, text="Сохранить PNG для печати", command=self.save_png).pack(side="left", padx=(0, ui.SPACE_S))
         if on_capture:
-            self.capture_button = ttk.Button(action, text="Снять пару · пробел / S", command=self.capture)
-            self.capture_button.pack(side="left", padx=3)
+            self.capture_button = ttk.Button(action, text="Снять пару · пробел / S", style="Accent.TButton", command=self.capture)
+            self.capture_button.pack(side="left", padx=(0, ui.SPACE_S))
         if counter_var is not None:
-            ttk.Label(action, textvariable=counter_var).pack(side="left", padx=12)
-        self.message_label = ttk.Label(self.controls, textvariable=self.message, wraplength=1100)
-        self.message_label.pack(anchor="w", pady=(7, 0))
+            ttk.Label(action, textvariable=counter_var, style="CardTitle.TLabel").pack(side="left", padx=ui.SPACE_S)
+        self.message_label = ttk.Label(self.controls, textvariable=self.message, style="Muted.TLabel", wraplength=1100)
+        self.message_label.pack(anchor="w", pady=(ui.SPACE_S, 0))
         self.controls.bind("<Configure>", lambda event: self.message_label.configure(wraplength=max(200, event.width - 30)))
         self.canvas = tk.Canvas(self.window, background="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -245,6 +245,7 @@ class BoardWindow:
         self.window.attributes("-fullscreen", self.fullscreen)
         self.window.lift()
         self.canvas.focus_set()
+        self.window.after_idle(ui.title_bar, self.window)
 
     def on_destroy(self, event):
         if event.widget is self.window:

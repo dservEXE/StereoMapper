@@ -10,6 +10,7 @@ import numpy as np
 from .body_measure import (BodyAccumulator, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, measure_person, outline_depth,
                            outline_disparity)
 from .people_tracking import PersonTracker
+from .version import VERSION
 
 
 DEFAULT_DISTANCE_M = 3.
@@ -48,6 +49,15 @@ def torso_depth(frame, observation) -> float | None:
     window = (slice(max(0, y - 4), y + 5), slice(max(0, x - 4), x + 5))
     values = frame.points[window][frame.valid[window]]
     return float(np.median(values[:, 2])) if len(values) else None
+
+
+def person_result(track_id, estimate) -> dict:
+    """Numbers for one person, as saved in experiments and in the people database."""
+    return dict(label=track_id, samples=estimate.samples, height_m=estimate.height_m, widths_m=estimate.widths_m,
+                side_widths_m=estimate.side_widths_m, lengths_m=estimate.lengths_m, volume_l=estimate.volume_l,
+                mass_kg=estimate.mass_kg, mass_low_kg=estimate.mass_low_kg, mass_high_kg=estimate.mass_high_kg,
+                side_observed=estimate.observed_side, views=estimate.view_coverage,
+                slices_front_m=estimate.slices_front_m, slices_side_m=estimate.slices_side_m)
 
 
 class WeighingSession(Thread):
@@ -193,13 +203,10 @@ class WeighingSession(Thread):
     def save(self, path) -> int:
         """Write numbers only: no images and nothing that identifies a person."""
         state = self.snapshot()
-        people = [dict(label=track_id, samples=e.samples, height_m=e.height_m, widths_m=e.widths_m,
-                       side_widths_m=e.side_widths_m, lengths_m=e.lengths_m, volume_l=e.volume_l,
-                       mass_kg=e.mass_kg, mass_low_kg=e.mass_low_kg, mass_high_kg=e.mass_high_kg,
-                       side_observed=e.observed_side, views=e.view_coverage,
-                       slices_front_m=e.slices_front_m, slices_side_m=e.slices_side_m)
-                  for track_id, e in sorted(state.known.items()) if e.samples]
+        people = [person_result(track_id, estimate) for track_id, estimate in sorted(state.known.items())
+                  if estimate.samples]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(dict(units="metres, litres, kilograms", validated_against_scales=False,
-                                        people=people), ensure_ascii=False, indent=2), encoding="utf-8")
+                                        app_version=VERSION, people=people), ensure_ascii=False, indent=2),
+                        encoding="utf-8")
         return len(people)

@@ -13,6 +13,7 @@ from tkinter import ttk
 import urllib.error
 import webbrowser
 
+from . import ui
 from .version import VERSION
 from .updates import (Cancelled, check_release, download_release, cleanup, state_root,
                       update_root, owned_directory, REPOSITORY)
@@ -21,7 +22,7 @@ INTERVAL = 6 * 3600
 
 
 class UpdateController:
-    def __init__(self, app, parent):
+    def __init__(self, app, parent, status_parent=None):
         self.app, self.root = app, app.root
         self.file = state_root() / "updates-settings.json"
         try:
@@ -39,21 +40,26 @@ class UpdateController:
         self.events_lock = Lock()
         self.thread = None
         self.auto = tk.BooleanVar(master=self.root, value=self.settings.get("auto") is not False)
-        self.text = tk.StringVar(master=self.root, value=f"Версия {VERSION} · проверка обновлений включена" if self.auto.get() else f"Версия {VERSION}")
-        self.frame = ttk.Frame(parent, style="App.TFrame")
-        self.frame.pack(fill="x", pady=(0, 10), before=app.workflow)
-        self.label = ttk.Label(self.frame, textvariable=self.text, style="App.TLabel", wraplength=520)
+        self.text = tk.StringVar(master=self.root, value=f"Версия {VERSION}")
+        # The version and the check live quietly in the status bar when one is given.
+        self.frame = ttk.Frame(status_parent or parent)
+        if status_parent is None:
+            self.frame.pack(fill="x", pady=(0, 10), before=app.workflow)
+        else:
+            self.frame.pack(side="right", padx=(ui.SPACE_L, 0))
+        self.label = ttk.Label(self.frame, textvariable=self.text, style="CardInfo.TLabel", wraplength=300)
         self.label.pack(side="left", fill="x", expand=True)
-        self.check_button = ttk.Button(self.frame, text="Проверить обновления", command=lambda: self.check(True))
+        self.check_button = ttk.Button(self.frame, text="Проверить обновления", style="Small.Quiet.TButton", command=lambda: self.check(True))
         self.check_button.pack(side="right")
-        self.auto_button = ttk.Checkbutton(self.frame, text="Автопроверка", variable=self.auto, command=self.configure)
-        self.auto_button.pack(side="right", padx=12)
-        self.banner = tk.Frame(parent, background="#dff3ef", padx=16, pady=10)
-        self.banner_text = tk.Label(self.banner, text="", background="#dff3ef", foreground="#1c514b", font=("Segoe UI", 11, "bold"), wraplength=550, justify="left")
+        self.auto_button = ttk.Checkbutton(self.frame, text="Автопроверка", style="Small.TCheckbutton", variable=self.auto, command=self.configure)
+        self.auto_button.pack(side="right", padx=ui.SPACE_M)
+        colors = ui.palette()
+        self.banner = tk.Frame(parent, background=colors.surface, padx=ui.SPACE_L, pady=ui.SPACE_S)
+        self.banner_text = tk.Label(self.banner, text="", background=colors.surface, foreground=colors.accent, font=ui.SECTION, wraplength=550, justify="left", anchor="w")
         self.banner_text.pack(side="left", fill="x", expand=True)
-        self.later_button = ttk.Button(self.banner, text="Позже", command=self.later)
-        self.later_button.pack(side="right", padx=8)
-        self.install_button = ttk.Button(self.banner, text="Обновить и перезапустить", command=self.install)
+        self.later_button = ttk.Button(self.banner, text="Позже", style="Toolbar.TButton", command=self.later)
+        self.later_button.pack(side="right", padx=(ui.SPACE_S, 0))
+        self.install_button = ttk.Button(self.banner, text="Обновить и перезапустить", style="Accent.TButton", command=self.install)
         self.install_button.pack(side="right")
         self.startup_id = self.root.after(1500, self.startup)
         self.schedule_id = self.root.after(INTERVAL * 1000, self.scheduled)
@@ -227,7 +233,7 @@ class UpdateController:
                         self.banner_text.configure(text="Новая версия " + self.available["version"] + " готова к установке")
                         self.install_button.configure(text="Скачать установщик" if self.available.get("requires_setup") else "Обновить и перезапустить")
                         if self.settings.get("dismissed") != self.available["tag"]:
-                            self.banner.pack(fill="x", pady=(0, 10), before=self.frame)
+                            self.banner.pack(fill="x", before=self.app.workflow)
                     else:
                         self.banner.pack_forget()
                         self.text.set("Обновлений пока нет · версия " + VERSION)

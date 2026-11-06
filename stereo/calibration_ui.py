@@ -7,31 +7,34 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from . import ui
+
 
 class StereoPreview(tk.Frame):
     def __init__(self, parent, counter_var=None):
-        super().__init__(parent, background="#142334", highlightthickness=1,
-                         highlightbackground="#49657c", padx=6, pady=6)
+        colors = ui.palette()
+        super().__init__(parent, background=colors.image_bg, highlightthickness=1,
+                         highlightbackground=colors.image_line, padx=6, pady=6)
         self.frames = None
         self.image = None
         self.hidden = False
         self.placement = None
-        header = tk.Frame(self, background="#142334")
+        header = tk.Frame(self, background=colors.image_bg)
         header.pack(fill="x")
         for text in ("Левая камера", "Правая камера"):
-            tk.Label(header, text=text, background="#142334", foreground="white").pack(
+            tk.Label(header, text=text, background=colors.image_bg, foreground=colors.image_ink, font=ui.CAPTION).pack(
                 side="left", expand=True)
-        self.canvas = tk.Canvas(self, width=448, height=168, background="#09121c",
+        self.canvas = tk.Canvas(self, width=448, height=168, background="#000000",
                                 highlightthickness=0)
         self.canvas.pack()
-        self.canvas.create_text(224, 84, text="Подключите камеры", fill="#c8d6e4")
-        footer = tk.Frame(self, background="#142334")
+        self.canvas.create_text(224, 84, text="Подключите камеры", fill=colors.image_muted, font=ui.BODY)
+        footer = tk.Frame(self, background=colors.image_bg)
         footer.pack(fill="x", pady=(4, 0))
-        tk.Label(footer, text="Пробел / S — снять пару", background="#142334",
-                 foreground="white").pack(side="left")
+        tk.Label(footer, text="Пробел / S — снять пару", background=colors.image_bg,
+                 foreground=colors.image_ink, font=ui.CAPTION).pack(side="left")
         if counter_var is not None:
-            tk.Label(footer, textvariable=counter_var, background="#142334",
-                     foreground="#c8d6e4").pack(side="right", padx=(12, 0))
+            tk.Label(footer, textvariable=counter_var, background=colors.image_bg,
+                     foreground=colors.image_muted, font=ui.CAPTION).pack(side="right", padx=(12, 0))
         self.bind("<Map>", lambda event: self.draw())
 
     def set_frames(self, frames):

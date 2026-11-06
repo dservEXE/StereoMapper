@@ -12,7 +12,8 @@ from .trackball import arcball_rotation, axis_rotation
 from .registration import rigid_transform, refine_icp
 from .cloud_orientation import (canonical_view, frame_from_plane, rotation_matrix,
                                 view_state, views_path, save_views, load_views)
-from .ui import apply_theme, ScrolledFrame
+from . import ui
+from .ui import ScrolledFrame
 
 FILE_TYPES = [("Облако или проект", "*.ply *.sqlite *.cloudproj"), ("PLY", "*.ply"),
               ("Архив карты", "*.sqlite"), ("Проект 3D", "*.cloudproj")]
@@ -21,8 +22,9 @@ FILE_TYPES = [("Облако или проект", "*.ply *.sqlite *.cloudproj")
 class CloudViewer:
     def __init__(self, parent, points, colors, units="metres", title="Редактор 3D-карты",
                  total_count=None, max_points=250000, archive_path=None, source_path=None):
-        apply_theme(parent)
+        ui.apply_theme(parent)
         self.window = tk.Toplevel(parent)
+        ui.style_window(self.window)
         self.window.title(title); self.window.geometry("1240x860"); self.window.minsize(1000,700)
         self.document = CloudDocument(points, colors, units, source=archive_path or source_path)
         self.max_points = max(1000,int(max_points))
@@ -103,8 +105,8 @@ class CloudViewer:
     def _orientation_ui(self,parent):
         pane=ScrolledFrame(parent); pane.pack(fill="both",expand=True)
         parent=pane.content
-        ttk.Label(parent,text="Верх и стороны карты",font=("Segoe UI",11,"bold")).pack(anchor="w")
-        ttk.Label(parent,text="Поверните карту как нужно, затем\nназначьте этот ракурс видом спереди.\nВерх экрана станет верхом карты.",foreground="#5b6975").pack(anchor="w",pady=7)
+        ttk.Label(parent,text="Верх и стороны карты",style="Section.TLabel").pack(anchor="w")
+        ttk.Label(parent,text="Поверните карту как нужно, затем\nназначьте этот ракурс видом спереди.\nВерх экрана станет верхом карты.",style="Muted.TLabel").pack(anchor="w",pady=7)
         self.button(self.row(parent),"Текущий вид = спереди",self.set_front)
         self.button(self.row(parent),"Горизонт по 3 точкам…",self.start_plane)
         self.button(self.row(parent),"Перевернуть верх / низ",self.flip_up)
@@ -118,13 +120,13 @@ class CloudViewer:
         ttk.Separator(parent).pack(fill="x",pady=8)
         for text,value in (("Перспектива","perspective"),("Ортографическая проекция","orthographic")):
             ttk.Radiobutton(parent,text=text,variable=self.projection,value=value,command=self.request_draw).pack(anchor="w")
-        ttk.Label(parent,text="Сохранённые положения",font=("Segoe UI",10,"bold")).pack(anchor="w",pady=(12,4))
+        ttk.Label(parent,text="Сохранённые положения",style="Section.TLabel").pack(anchor="w",pady=(12,4))
         self.bookmark_combo=ttk.Combobox(parent,textvariable=self.view_name,width=23)
         self.bookmark_combo.pack(fill="x")
         row=self.row(parent); self.button(row,"Запомнить",self.remember_view); self.button(row,"Перейти",self.recall_view)
         self.button(self.row(parent),"Удалить положение",self.remove_view)
         row=self.row(parent); self.button(row,"Сохранить виды…",self.export_views); self.button(row,"Загрузить…",self.import_views)
-        ttk.Label(parent,text="Проект хранит оси и виды внутри себя.\nПри экспорте PLY рядом сохраняется\nфайл .views.json — переносите оба.\nОриентация вида не двигает точки\nи не заменяет сшивку снимков.",foreground="#5b6975").pack(anchor="w",pady=10)
+        ttk.Label(parent,text="Проект хранит оси и виды внутри себя.\nПри экспорте PLY рядом сохраняется\nфайл .views.json — переносите оба.\nОриентация вида не двигает точки\nи не заменяет сшивку снимков.",style="Muted.TLabel").pack(anchor="w",pady=10)
         pane.attach_wheel()
 
     def capture_camera(self):
@@ -379,8 +381,9 @@ class CloudViewer:
 
     def show_help(self):
         dialog=tk.Toplevel(self.window); dialog.title("Как пользоваться редактором 3D"); dialog.geometry("780x640")
+        ui.style_window(dialog)
         frame=ttk.Frame(dialog,padding=12); frame.pack(fill="both",expand=True)
-        text=tk.Text(frame,wrap="word",font=("Segoe UI",11),padx=10,pady=10)
+        text=tk.Text(frame,wrap="word",font=(ui.FONT,11),padx=14,pady=12,spacing3=4)
         scroll=ttk.Scrollbar(frame,command=text.yview); text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right",fill="y"); text.pack(fill="both",expand=True)
         path=Path(__file__).resolve().parents[1]/"3D_EDITOR_GUIDE.md"
@@ -702,7 +705,7 @@ class CloudViewer:
             end=origin+vector[:2]*40
             self.canvas.create_line(*origin,*end,fill=color,width=2,arrow="last")
             self.canvas.create_text(* (end+[5,-9]),text=label,fill=color,anchor="w")
-        self.canvas.create_text(w-12,12,anchor="ne",fill="#adc3d1",text="Ортографическая проекция" if self.projection.get()=="orthographic" else "Перспектива")
+        self.canvas.create_text(w-12,12,anchor="ne",fill=ui.palette().image_muted,text="Ортографическая проекция" if self.projection.get()=="orthographic" else "Перспектива")
         if self.plane_points:
             xy,_,front=project_points(self.plane_points,w,h,**self.camera())
             for index,((x,y),visible) in enumerate(zip(xy,front),1):
@@ -711,7 +714,7 @@ class CloudViewer:
                     self.canvas.create_text(x+12,y-12,text=str(index),fill="#ffda45")
         if self.drag and self.drag["mode"]=="rotate":
             radius=min(w,h)/2
-            self.canvas.create_oval(w/2-radius,h/2-radius,w/2+radius,h/2+radius,outline="#536576",dash=(4,6))
+            self.canvas.create_oval(w/2-radius,h/2-radius,w/2+radius,h/2+radius,outline=ui.palette().image_line,dash=(4,6))
         if self.drag and self.drag["mode"]=="rectangle":self.canvas.create_rectangle(*self.drag["start"],*self.drag["last"],outline="#ffda45",width=2,dash=(5,3))
         elif self.drag and self.drag["mode"]=="lasso" and len(self.stroke)>1:self.canvas.create_line(*np.asarray(self.stroke).ravel().tolist(),fill="#ffda45",width=2)
         self.draw_brush_cursor()

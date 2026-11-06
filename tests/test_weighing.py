@@ -1056,6 +1056,17 @@ class TabTests(unittest.TestCase):
         self.tab.sync()
         self.assertEqual(self.sent, [("weighing", True), ("weighing", False)])
 
+    def test_leaving_the_tab_really_reaches_the_weighing_tab(self):
+        # A later bind without add="+" once replaced this handler, and weighing kept running.
+        script = self.app.workflow.bind("<<NotebookTabChanged>>")
+        self.assertEqual(script.count("if {"), 2, script)
+        self.tab.available = True
+        self.connect()
+        self.open_tab()
+        self.app.show_page("scan")
+        self.window.update()
+        self.assertEqual(self.sent[-1], ("weighing", False))
+
     def test_disconnect_stops_without_sending_to_a_missing_worker(self):
         self.tab.available = True
         self.connect()
@@ -1075,10 +1086,94 @@ class TabTests(unittest.TestCase):
     def test_saved_experiments_are_listed_and_open_when_chosen(self):
         ExperimentHistoryTests().save(self.temp.name, "20261106_100000")
         self.tab.refresh_history()
-        self.assertEqual(self.tab.history_list.size(), 1)
-        self.tab.history_list.selection_set(0)
+        rows = self.tab.history_list.get_children()
+        self.assertEqual(len(rows), 1)
+        self.tab.history_list.selection_set(rows[0])
         self.tab.show_experiment()
         self.assertIn("Человек №1", self.tab.history_text.get())
+
+    def fill_form(self, height="158", weight="53,5", label="A-01"):
+        self.tab.entry_height.set(height)
+        self.tab.entry_weight.set(weight)
+        self.tab.entry_label.set(label)
+
+    def live_state(self):
+        frame = FakeFrame()
+        session = WeighingSession(lambda status: None)
+        session.bodies[1] = BodyAccumulator()
+        for _ in range(20):
+            session.bodies[1].add(sample_at())
+        return session.analyse(_single(frame), frame, K, 2.)
+
+    def test_live_measurement_with_real_data_goes_into_the_database(self):
+        self.tab.shown = self.live_state()
+        self.tab.refresh_sources()
+        self.assertTrue(self.tab.entry_source.get().startswith("Сейчас"))
+        self.fill_form()
+        self.tab.add_to_database()
+        self.assertIn("Записано", self.tab.entry_feedback.get())
+        entries = self.tab.database.entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].real_weight_kg, 53.5)
+        self.assertEqual(entries[0].label, "A-01")
+        self.assertGreater(entries[0].measurement["samples"], 0)
+        self.assertEqual(len(self.tab.database_table.get_children()), 1)
+        self.assertEqual(self.tab.entry_height.get(), "")
+
+    def test_wrong_input_is_explained_and_nothing_is_saved(self):
+        self.tab.shown = self.live_state()
+        self.tab.refresh_sources()
+        self.fill_form(height="abc")
+        self.tab.add_to_database()
+        self.assertIn("Рост", self.tab.entry_feedback.get())
+        self.assertEqual(self.tab.database.entries(), [])
+        self.assertEqual(self.tab.entry_height.get(), "abc")
+
+    def test_nothing_measured_yet_asks_for_a_measurement_first(self):
+        self.fill_form()
+        self.tab.add_to_database()
+        self.assertIn("замер", self.tab.entry_feedback.get())
+        self.assertEqual(self.tab.database.entries(), [])
+
+    def test_saved_experiment_can_be_paired_with_real_data_later(self):
+        ExperimentHistoryTests().save(self.temp.name, "20261106_100000")
+        self.tab.refresh_history()
+        self.tab.history_list.selection_set(self.tab.history_list.get_children()[0])
+        self.tab.use_experiment()
+        self.assertIn("06.11 10:00:00", self.tab.entry_source.get())
+        self.fill_form()
+        self.tab.add_to_database()
+        self.assertEqual(self.tab.database.entries()[0].estimated_weight_kg, 71.4)
+
+    def test_deleting_asks_first_and_removes_only_after_a_yes(self):
+        self.tab.shown = self.live_state()
+        self.tab.refresh_sources()
+        self.fill_form()
+        self.tab.add_to_database()
+        row = self.tab.database_table.get_children()[0]
+        self.tab.database_table.selection_set(row)
+        with patch("stereo.weighing_ui.messagebox.askyesno", return_value=False):
+            self.tab.delete_entry()
+        self.assertEqual(len(self.tab.database.entries()), 1)
+        with patch("stereo.weighing_ui.messagebox.askyesno", return_value=True):
+            self.tab.delete_entry()
+        self.assertEqual(self.tab.database.entries(), [])
+        self.assertEqual(self.tab.database_table.get_children(), ())
+
+    def test_export_writes_a_file_and_says_where(self):
+        self.tab.shown = self.live_state()
+        self.tab.refresh_sources()
+        self.fill_form()
+        self.tab.add_to_database()
+        self.tab.export_database()
+        self.assertIn("Сохранено записей: 1", self.tab.database_summary.get())
+        self.assertEqual(len(list((Path(self.temp.name) / "output").glob("people_database_*.csv"))), 1)
+
+    def test_large_figures_show_the_person_measured_most(self):
+        state = self.live_state()
+        self.tab.show_metrics(state)
+        self.assertIn("кг", self.tab.metric_weight.get())
+        self.assertIn("см", self.tab.metric_height.get())
 
     def test_poll_shows_the_latest_state_once(self):
         self.tab.available = True

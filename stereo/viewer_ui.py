@@ -1,15 +1,26 @@
 """A quiet editing workspace with progressive disclosure of volume controls."""
 import tkinter as tk
 from tkinter import ttk
-from .ui import ScrolledFrame, Foldout, note, NIGHT
+from . import ui
+from .ui import ScrolledFrame, Foldout, note
+
+
+def fill_button_rows(parent):
+    """Buttons of the side panel share the width of their row, so their edges line up."""
+    for child in parent.winfo_children():
+        fill_button_rows(child)
+        buttons=child.winfo_children()
+        if isinstance(child,ttk.Frame) and buttons and all(isinstance(item,ttk.Button) for item in buttons):
+            for index,item in enumerate(buttons):
+                item.pack_configure(fill="x",expand=True,padx=(0 if index==0 else 3,0 if index==len(buttons)-1 else 3))
 
 
 def build(v):
-    header=ttk.Frame(v.window,padding=(16,12,16,6)); header.pack(fill="x")
+    header=ttk.Frame(v.window,padding=(ui.SPACE_L,10,ui.SPACE_M,6)); header.pack(fill="x")
     ttk.Label(header,text="Редактор 3D",style="Heading.TLabel").pack(side="left")
     v.button(header,"Помощь  ?",v.show_help).pack_configure(side="right")
-    v.caption=ttk.Label(header,style="Muted.TLabel"); v.caption.pack(side="right",padx=12)
-    files=ttk.Frame(v.window,padding=(12,0)); files.pack(fill="x")
+    v.caption=ttk.Label(header,style="Muted.TLabel"); v.caption.pack(side="right",padx=ui.SPACE_M)
+    files=ttk.Frame(v.window,padding=(ui.SPACE_M,0)); files.pack(fill="x")
     v.button(files,"Открыть…",v.open_file)
     v.button(files,"+ Добавить снимок…",v.add_file)
     v.undo_button=v.button(files,"Отменить",v.undo)
@@ -17,21 +28,24 @@ def build(v):
     v.project_button=v.button(files,"Сохранить проект…",v.save_project)
     v.project_button.configure(style="Accent.TButton"); v.project_button.pack_configure(side="right")
     v.export_button=v.button(files,"Экспорт PLY…",v.save_ply); v.export_button.pack_configure(side="right")
-    tools=ttk.Frame(v.window,padding=(16,10,12,0)); tools.pack(fill="x")
+    tools=ttk.Frame(v.window,padding=(ui.SPACE_L,ui.SPACE_S,ui.SPACE_M,0)); tools.pack(fill="x")
     for text,name in (("Вращать","rotate"),("Прямоугольник","rectangle"),("Лассо","lasso"),("Кисть","brush")):
-        ttk.Radiobutton(tools,text=text,variable=v.tool,value=name,command=v.tool_changed).pack(side="left",padx=(0,12))
+        ttk.Radiobutton(tools,text=text,variable=v.tool,value=name,command=v.tool_changed).pack(side="left",padx=(0,ui.SPACE_M))
     v.button(tools,"Вписать",v.fit)
     for text,name in (("Спереди","front"),("Сверху","top"),("Справа","right")):
         v.button(tools,text,lambda n=name:v.preset(n))
     v.button(tools,"Сброс вида",v.reset)
     help_label=ttk.Label(v.window,textvariable=v.help_text,style="Muted.TLabel",wraplength=1150)
-    help_label.pack(fill="x",padx=18,pady=(8,12))
-    body=ttk.Frame(v.window,padding=(12,0)); body.pack(fill="both",expand=True)
-    side=ttk.Frame(body,width=335); side.pack(side="right",fill="y",padx=(12,0)); side.pack_propagate(False)
-    v.canvas=tk.Canvas(body,background=NIGHT,highlightthickness=0,takefocus=True)
+    help_label.pack(fill="x",padx=ui.SPACE_L,pady=(ui.SPACE_XS,ui.SPACE_S))
+    bottom=ttk.Frame(v.window,padding=(ui.SPACE_L,ui.SPACE_S)); bottom.pack(side="bottom",fill="x")
+    stats_label=ttk.Label(bottom,textvariable=v.stats,style="CardInfo.TLabel",wraplength=1150); stats_label.pack(anchor="w")
+    message=ttk.Label(bottom,textvariable=v.message,wraplength=1150,style="Accent.TLabel"); message.pack(anchor="w",pady=(ui.SPACE_XS,0))
+    body=ttk.Frame(v.window,style="App.TFrame",padding=ui.SPACE_M); body.pack(fill="both",expand=True)
+    side=ttk.Frame(body,width=335,style="App.TFrame"); side.pack(side="right",fill="y",padx=(ui.SPACE_M,0)); side.pack_propagate(False)
+    v.canvas=tk.Canvas(body,background=ui.palette().image_bg,highlightthickness=0,takefocus=True)
     v.canvas.pack(side="left",fill="both",expand=True)
     book=ttk.Notebook(side,style="Inner.TNotebook"); book.pack(fill="both",expand=True); v.notebook=book
-    edit_pane=ScrolledFrame(book); merge_pane=ScrolledFrame(book); orientation=ttk.Frame(book,padding=8)
+    edit_pane=ScrolledFrame(book); merge_pane=ScrolledFrame(book); orientation=ttk.Frame(book)
     book.add(edit_pane,text="Очистка"); book.add(merge_pane,text="Сшивка"); book.add(orientation,text="Ориентация")
     edit,merge=edit_pane.content,merge_pane.content
     v._orientation_ui(orientation)
@@ -43,7 +57,7 @@ def build(v):
     v.keep_button.configure(style="Accent.TButton")
     v.button(v.row(edit),"Снять выделение  ·  Esc",v.clear_selection)
     note(edit,"Ctrl+Z возвращает удалённое. Исходный скан сохраняется.")
-    ttk.Separator(edit).pack(fill="x",pady=8)
+    ttk.Separator(edit).pack(fill="x",pady=ui.SPACE_S)
     ttk.Label(edit,text="Как объединять выделения",style="Section.TLabel").pack(anchor="w")
     v.operation_combo=v.combo(edit,v.operation,("Новое","Добавить","Вычесть","Пересечение"))
     row=v.row(edit); ttk.Label(row,text="Радиус кисти, px").pack(side="left")
@@ -56,20 +70,20 @@ def build(v):
     ttk.Label(advanced,text="Область действия").pack(anchor="w")
     v.combo(advanced,v.selection_scope,("Все облака","Выбранное облако"))
     v.layer_combo=v.combo(advanced,v.active_layer,())
-    ttk.Checkbutton(advanced,text="Ограничить глубину выделения",variable=v.depth_enabled,command=v.request_draw).pack(anchor="w",pady=8)
+    ttk.Checkbutton(advanced,text="Ограничить глубину выделения",variable=v.depth_enabled,command=v.request_draw).pack(anchor="w",pady=ui.SPACE_S)
     ttk.Label(advanced,text="Ближняя и дальняя границы").pack(anchor="w")
     for var in (v.depth_near,v.depth_far):
         ttk.Scale(advanced,from_=0,to=100,variable=var,command=lambda n:v.request_draw()).pack(fill="x",pady=3)
     note(advanced,"Глубина отсчитывается вдоль взгляда. Поверните карту и проверьте границы.")
     row=v.row(advanced); v.button(row,"Объём XYZ…",v.select_box); v.button(row,"Инверсия",v.invert_selection)
-    ttk.Label(advanced,text="Размер точек на экране").pack(anchor="w",pady=(12,0))
+    ttk.Label(advanced,text="Размер точек на экране").pack(anchor="w",pady=(ui.SPACE_M,0))
     v.combo(advanced,v.point_size,(1,2,3,4),5).bind("<<ComboboxSelected>>",lambda e:v.request_draw())
     ttk.Label(merge,text="Сшейте несколько снимков",style="Section.TLabel").pack(anchor="w")
     note(merge,"1. Добавьте снимок с общей поверхностью.\n2. Укажите одинаковые детали на обоих.\n3. Совместите и проверьте результат.")
     v.button(v.row(merge),"+ Добавить снимок…",v.add_file)
-    ttk.Label(merge,text="Основной снимок",style="Section.TLabel").pack(anchor="w",pady=(12,0))
+    ttk.Label(merge,text="Основной снимок",style="Section.TLabel").pack(anchor="w",pady=(ui.SPACE_M,0))
     v.reference_combo=v.combo(merge,v.reference_layer,())
-    ttk.Label(merge,text="Добавленный снимок").pack(anchor="w",pady=(7,0))
+    ttk.Label(merge,text="Добавленный снимок").pack(anchor="w",pady=(ui.SPACE_S,0))
     v.moving_combo=v.combo(merge,v.moving_layer,())
     for control in (v.reference_combo,v.moving_combo):control.bind("<<ComboboxSelected>>",lambda e:v.cancel_landmarks())
     v.merge_buttons=[]
@@ -79,10 +93,8 @@ def build(v):
     row=v.row(merge); v.button(row,"Показать оба",v.show_all); v.button(row,"Сброс меток",v.cancel_landmarks)
     note(merge,variable=v.merge_text)
     note(merge,"Выбирайте разнесённые детали в общей части. Снимки должны иметь одинаковый масштаб. После сшивки сохраните проект для дальнейшего редактирования.")
+    for pane in (edit,merge,advanced,orientation):fill_button_rows(pane)
     edit_pane.attach_wheel(); merge_pane.attach_wheel()
-    bottom=ttk.Frame(v.window,padding=(16,10)); bottom.pack(fill="x")
-    stats_label=ttk.Label(bottom,textvariable=v.stats,style="CardInfo.TLabel",wraplength=1150); stats_label.pack(anchor="w")
-    message=ttk.Label(bottom,textvariable=v.message,wraplength=1150,foreground="#087e80"); message.pack(anchor="w",pady=(5,0))
     def resize(event):
         width=max(400,event.width-36)
         help_label.configure(wraplength=width); stats_label.configure(wraplength=width); message.configure(wraplength=width)

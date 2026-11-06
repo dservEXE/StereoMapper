@@ -4,24 +4,30 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image,ImageTk
 
+from . import ui
+
 
 class CalibrationHelpWindow:
     def __init__(self,parent,directory):
         self.window=tk.Toplevel(parent)
+        ui.style_window(self.window)
         self.window.help_view=self
         self.window.title('Калибровка · какие ракурсы снимать')
         self.window.geometry('1080x860')
-        title=ttk.Frame(self.window,padding=14);title.pack(fill='x')
-        ttk.Label(title,text='33 разных ракурса, а не 33 приближения',font=('Segoe UI',18,'bold')).pack(anchor='w')
-        ttk.Label(title,text='Фокус и положение объективов фиксируются до съёмки. Доска целиком видна и резкая в обеих камерах.',wraplength=1020).pack(anchor='w',pady=(6,0))
-        navigation=ttk.Frame(title);navigation.pack(anchor='w',pady=(8,0))
+        ttk.Button(self.window,text='Закрыть',style='Accent.TButton',command=self.window.destroy).pack(side='bottom',anchor='e',padx=ui.SPACE_L,pady=ui.SPACE_M)
+        ttk.Separator(self.window).pack(side='bottom',fill='x')
+        title=ttk.Frame(self.window,padding=(ui.SPACE_L,ui.SPACE_M));title.pack(fill='x')
+        ttk.Label(title,text='33 разных ракурса, а не 33 приближения',style='Heading.TLabel').pack(anchor='w')
+        ttk.Label(title,text='Фокус и положение объективов фиксируются до съёмки. Доска целиком видна и резкая в обеих камерах.',style='Muted.TLabel',wraplength=1020).pack(anchor='w',pady=(ui.SPACE_XS,0))
+        navigation=ttk.Frame(title);navigation.pack(anchor='w',pady=(ui.SPACE_S,0))
+        ttk.Separator(self.window).pack(fill='x')
         host=ttk.Frame(self.window);host.pack(fill='both',expand=True)
-        canvas=tk.Canvas(host,highlightthickness=0,background='#eef3f7')
+        canvas=tk.Canvas(host,highlightthickness=0,background=ui.palette().surface)
         scroll=ttk.Scrollbar(host,orient='vertical',command=canvas.yview)
         canvas.configure(yscrollcommand=scroll.set)
         self.canvas=canvas
         scroll.pack(side='right',fill='y');canvas.pack(side='left',fill='both',expand=True)
-        body=ttk.Frame(canvas,padding=16)
+        body=ttk.Frame(canvas,padding=(ui.SPACE_L,ui.SPACE_S))
         item=canvas.create_window(0,0,window=body,anchor='nw')
         body.bind('<Configure>',lambda event:canvas.configure(scrollregion=canvas.bbox('all')))
         canvas.bind('<Configure>',lambda event:canvas.itemconfigure(item,width=event.width))
@@ -39,9 +45,12 @@ class CalibrationHelpWindow:
             ('6. Каждый снимок','Переставьте доску или камеру, затем полностью остановите обе. Подождите 1–2 секунды и снимите пару. Не захватывайте доску во время движения. Избегайте бликов, смаза и муара экранных клеток.'),
             ('7. Расчёт и проверка','Программа требует минимум 15 пар и 5 заметно наклонных ракурсов. Лучше пройти весь план из 33. Маленький RMS не доказывает точность в миллиметрах: после принятия проверьте новые ракурсы по линиям выравнивания и несколько размеров известного эталона на рабочей дистанции 15/30 см. Повторите измерения 5–10 раз.'),
             ('8. Близкая глубина','До подключения выберите профиль «Зона 1×1 м · с 15 см»: ближний поиск включён, от 10 см, широкое поле зрения. Быстрый профиль с поиском 96 пикселей не охватывает 10–15 см при текущей калибровке. Шаг карты 1 мм задаёт плотность, а не удостоверяет точность.')]
+        texts=[]
         for heading,text in paragraphs:
-            ttk.Label(body,text=heading,font=('Segoe UI',12,'bold')).pack(anchor='w',pady=(12,4))
-            ttk.Label(body,text=text,wraplength=980,justify='left').pack(anchor='w',fill='x')
+            ttk.Label(body,text=heading,style='Section.TLabel').pack(anchor='w',pady=(ui.SPACE_M,ui.SPACE_XS))
+            texts.append(ttk.Label(body,text=text,wraplength=980,justify='left'))
+            texts[-1].pack(anchor='w',fill='x')
+        ui.fit_wrap(body,*texts,margin=ui.SPACE_L*2)
         image_path=Path(directory)/'calibration_poses.png'
         self.photo=None
         if image_path.exists():
@@ -54,6 +63,5 @@ class CalibrationHelpWindow:
                 self.window.update_idletasks()
                 canvas.yview_moveto(max(0,(self.illustration.winfo_y()-8)/max(1,body.winfo_height())))
             self.show_diagram=show_diagram
-            ttk.Button(navigation,text='Схема наклонов',command=show_diagram).pack(side='left',padx=(0,8))
-        ttk.Button(navigation,text='К инструкции',command=lambda:canvas.yview_moveto(0)).pack(side='left')
-        ttk.Button(self.window,text='Закрыть',command=self.window.destroy).pack(anchor='e',padx=16,pady=10)
+            ttk.Button(navigation,text='Схема наклонов',style='Toolbar.TButton',command=show_diagram).pack(side='left',padx=(0,ui.SPACE_S))
+        ttk.Button(navigation,text='К инструкции',style='Toolbar.TButton',command=lambda:canvas.yview_moveto(0)).pack(side='left')

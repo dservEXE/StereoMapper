@@ -5,7 +5,7 @@ from threading import Thread
 import os
 from pathlib import Path
 from .storage import ResearchCatalog,size_text
-from .ui import apply_theme
+from . import ui
 
 
 def session_cloud(directory):
@@ -21,11 +21,12 @@ def session_cloud(directory):
 
 class StorageWindow:
     def __init__(self,parent,workspace,protected=lambda:[],busy=lambda:False,on_open_cloud=None):
-        apply_theme(parent)
+        ui.apply_theme(parent)
         self.on_open_cloud=on_open_cloud
         self.catalog=ResearchCatalog(workspace)
         self.protected,self.external_busy=protected,busy
         self.window=tk.Toplevel(parent)
+        ui.style_window(self.window)
         self.window.title("Сохранённые сеансы · StereoMapper")
         self.window.geometry("1100x620")
         self.window.minsize(850,460)
@@ -35,23 +36,23 @@ class StorageWindow:
         self.selection=tk.StringVar(value="Выберите сеанс, чтобы открыть результат")
         outer=ttk.Frame(self.window,padding=16);outer.pack(fill="both",expand=True)
         ttk.Label(outer,text="Сохранённые сеансы",style="Heading.TLabel").pack(anchor="w")
-        ttk.Label(outer,textvariable=self.summary).pack(anchor="w",pady=7)
-        ttk.Label(outer,text="Выберите сеанс и откройте его карту в 3D. Двойной щелчок открывает карту; папку с остальными файлами можно открыть отдельно.",wraplength=1000,style="Muted.TLabel").pack(anchor="w",pady=(0,10))
+        ttk.Label(outer,textvariable=self.summary,style="CardTitle.TLabel").pack(anchor="w",pady=(ui.SPACE_XS,ui.SPACE_S))
+        ttk.Label(outer,text="Выберите сеанс и откройте его карту в 3D. Двойной щелчок открывает карту; папку с остальными файлами можно открыть отдельно.",wraplength=1000,style="Muted.TLabel").pack(anchor="w",pady=(0,ui.SPACE_M))
         frame=ttk.Frame(outer);frame.pack(fill="both",expand=True)
         self.table=ttk.Treeview(frame,columns=("date","kind","size","name","state"),show="headings",selectmode="extended")
         for key,title,width in (("date","Изменено (МСК)",135),("kind","Тип",165),("size","Размер",85),("name","Сеанс",245),("state","Состояние",200)):
-            self.table.heading(key,text=title);self.table.column(key,width=width,minwidth=65)
+            self.table.heading(key,text=title,anchor="w");self.table.column(key,width=width,minwidth=65)
         scroll=ttk.Scrollbar(frame,orient="vertical",command=self.table.yview)
         self.table.configure(yscrollcommand=scroll.set);self.table.pack(side="left",fill="both",expand=True);scroll.pack(side="right",fill="y")
         self.table.bind("<<TreeviewSelect>>",lambda event:self.selected())
         self.table.bind("<Double-1>",lambda event:self.open_cloud())
-        ttk.Label(outer,textvariable=self.selection).pack(anchor="w",pady=10)
+        ttk.Label(outer,textvariable=self.selection,style="Muted.TLabel").pack(anchor="w",pady=ui.SPACE_S)
         bar=ttk.Frame(outer);bar.pack(fill="x")
         self.refresh_button=ttk.Button(bar,text="Обновить список",command=self.refresh);self.refresh_button.pack(side="left")
-        self.open_button=ttk.Button(bar,text="Открыть в 3D",command=self.open_cloud,style="Accent.TButton",state="disabled");self.open_button.pack(side="left",padx=8)
-        ttk.Button(bar,text="Открыть выбранную папку",command=self.open_folder).pack(side="left",padx=8)
+        self.open_button=ttk.Button(bar,text="Открыть в 3D",command=self.open_cloud,style="Accent.TButton",state="disabled");self.open_button.pack(side="left",padx=(ui.SPACE_S,0))
+        ttk.Button(bar,text="Открыть выбранную папку",command=self.open_folder).pack(side="left",padx=(ui.SPACE_S,0))
         self.remove_button=ttk.Button(bar,text="Удалить выбранные…",command=self.remove,style="Danger.TButton");self.remove_button.pack(side="right")
-        ttk.Label(outer,text="Удаление убирает папку сеанса целиком. Открытые сеансы защищены; перед очисткой остановите камеры.",style="Muted.TLabel",wraplength=1000).pack(anchor="w",pady=(10,0))
+        ttk.Label(outer,text="Удаление убирает папку сеанса целиком. Открытые сеансы защищены; перед очисткой остановите камеры.",style="CardInfo.TLabel",wraplength=1000).pack(anchor="w",pady=(ui.SPACE_M,0))
         self.window.protocol("WM_DELETE_WINDOW",self.close)
         self.refresh();self.poll_id=self.window.after(100,self.poll)
         self.window.bind('<Destroy>',self.on_destroy,add='+')
@@ -121,7 +122,7 @@ class StorageWindow:
                     for i,item in enumerate(value):
                         key=str(i);self.items[key]=item
                         self.table.insert("", "end",iid=key,values=(item.changed,item.kind,size_text(item.size),item.path.name,item.blocked),tags=("locked",) if item.blocked else ())
-                    self.table.tag_configure("locked",foreground="#7c8795")
+                    self.table.tag_configure("locked",foreground=ui.palette().disabled)
                     self.summary.set(f"Сеансов: {len(value)} · всего {size_text(sum(x.size for x in value))}")
                     self.selected()
                 elif kind=="removed":

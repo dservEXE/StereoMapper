@@ -20,17 +20,17 @@ from .board import BoardSpec, BoardWindow
 from .calibration_ui import CalibrationShortcuts
 from .help_ui import help_icon, HELP
 from .presets import PRESETS
-from .ui import NIGHT
+from . import ui
 
 
 class ImagePanel(ttk.Frame):
     def __init__(self, parent, title, click=None, empty="Ожидание изображения",hint="Изображение появится после начала съёмки"):
-        super().__init__(parent, style="Card.TFrame", padding=8)
+        super().__init__(parent, style="Card.TFrame", padding=10)
         self.title_label = ttk.Label(self, text=title, style="CardTitle.TLabel", wraplength=380)
-        self.title_label.pack(anchor="w", pady=(0, 7))
-        self.bind("<Configure>", lambda event: self.title_label.configure(wraplength=max(140, event.width-20)))
+        self.title_label.pack(anchor="w", pady=(0, ui.SPACE_S))
+        self.bind("<Configure>", lambda event: self.title_label.configure(wraplength=max(140, event.width-32)))
         self.empty,self.empty_hint=empty,hint
-        self.canvas = tk.Canvas(self, background=NIGHT, highlightthickness=0, width=400, height=270)
+        self.canvas = tk.Canvas(self, background=ui.palette().image_bg, highlightthickness=0, width=400, height=270)
         self.canvas.pack(fill="both", expand=True)
         self.image = None
         self.source = None
@@ -50,11 +50,7 @@ class ImagePanel(ttk.Frame):
             self.canvas.delete("all")
             w,h=max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height())
             if w<140 or h<100:return
-            x,y=w/2,max(40,h/2-55)
-            self.canvas.create_rectangle(x-34,y-20,x+34,y+20,outline="#4e6b83",width=2)
-            for dx in (-15,15):self.canvas.create_oval(x+dx-8,y-8,x+dx+8,y+8,outline="#79afb9",width=2)
-            self.canvas.create_text(x,y+48,text=self.empty,fill="#d6e5f1",font=("Segoe UI",12,"bold"),width=max(120,w-40),justify="center")
-            self.canvas.create_text(x,y+94,text=self.empty_hint,fill="#90a8bf",font=("Segoe UI",10),width=max(120,w-50),justify="center")
+            self.draw_placeholder(w,h)
             return
         if not self.winfo_viewable():return
         h, w = self.source.shape[:2]
@@ -67,6 +63,14 @@ class ImagePanel(ttk.Frame):
         self.canvas.delete("all")
         self.canvas.create_image(ox, oy, anchor="nw", image=self.image)
         self.geometry = (ox, oy, dw, dh, w, h)
+
+    def draw_placeholder(self, w, h):
+        """Viewfinder corners and two lines of text; the panel holds no picture yet."""
+        colors=ui.palette()
+        for x,y,dx,dy in ((16,16,1,1),(w-16,16,-1,1),(16,h-16,1,-1),(w-16,h-16,-1,-1)):
+            self.canvas.create_line(x+dx*22,y,x,y,x,y+dy*22,fill=colors.image_line,width=1)
+        self.canvas.create_text(w/2,h/2-2,anchor="s",text=self.empty,fill=colors.image_ink,font=ui.SECTION,width=max(120,w-72),justify="center")
+        self.canvas.create_text(w/2,h/2+4,anchor="n",text=self.empty_hint,fill=colors.image_muted,font=ui.BODY,width=max(120,w-72),justify="center")
 
     def clear(self):
         self.source=self.geometry=None
@@ -122,7 +126,8 @@ class StereoApp:
                      "voxel_mm": tk.StringVar(value="5"),"map_stride":tk.StringVar(value="2"),
                      "preview_points":tk.StringVar(value="250000"),"near_minimum_cm":tk.StringVar(value="10"),
                      "profile":tk.StringVar(value="Свои настройки"),"estimate_surfaces":self.smooth_depth,
-                     "acceleration":tk.StringVar(value="Авто · NVIDIA / CPU")}
+                     "acceleration":tk.StringVar(value="Авто · NVIDIA / CPU"),
+                     "theme":tk.StringVar(value=ui.THEME_LABELS["dark"]),"animations":tk.BooleanVar(value=True)}
         self.vars['ghost_filter']=tk.StringVar(value="Обычная")
         self.load_settings()
         self.build()
@@ -150,33 +155,39 @@ class StereoApp:
         except (OSError, ValueError, tk.TclError):
             pass
 
-    def entry(self, parent, text, key, row, values=None):
-        parent.columnconfigure(0, weight=1)
-        ttk.Label(parent, text=text, wraplength=140).grid(row=row, column=0, sticky="w", pady=5)
+    def entry(self, parent, text, key, row, values=None, stretch=False):
+        # Narrow panes keep one field width; wide ones let the fields grow with the pane.
+        if stretch:
+            parent.columnconfigure(0, minsize=150)
+            parent.columnconfigure(1, weight=1)
+        else:
+            parent.columnconfigure(0, weight=1)
+            parent.columnconfigure(1, minsize=118)
+        ttk.Label(parent, text=text, wraplength=140).grid(row=row, column=0, sticky="w", pady=ui.SPACE_XS)
         widget = (ttk.Combobox(parent, textvariable=self.vars[key], values=values,
-                               state="readonly", width=10) if values else
-                  ttk.Entry(parent, textvariable=self.vars[key], width=10))
-        widget.grid(row=row, column=1, sticky="e", pady=3)
-        help_icon(parent, key).grid(row=row, column=2, padx=(7, 0))
+                               state="readonly", width=8) if values else
+                  ttk.Entry(parent, textvariable=self.vars[key], width=8))
+        widget.grid(row=row, column=1, sticky="ew", pady=ui.SPACE_XS)
+        help_icon(parent, key).grid(row=row, column=2, padx=(ui.SPACE_S, 0))
         self.settings_controls.append((widget, "readonly" if values else "normal"))
 
     def check(self, parent, text, variable, key, command=None, setting=False):
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=4)
+        row.pack(fill="x", pady=ui.SPACE_XS)
         control = ttk.Checkbutton(row, text=text, variable=variable, command=command)
         control.pack(side="left")
-        help_icon(row, key).pack(side="right", padx=2)
+        help_icon(row, key).pack(side="right", padx=(ui.SPACE_S, 0))
         if setting:
             self.settings_controls.append((control, "normal"))
         return control
 
     def button(self, parent, text, command, key=None, accent=False):
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=4)
+        row.pack(fill="x", pady=ui.SPACE_XS)
         control = ttk.Button(row, text=text, command=command, style="Accent.TButton" if accent else "TButton")
         control.pack(side="left", fill="x", expand=True)
         if key:
-            help_icon(row, key).pack(side="right", padx=(7, 0))
+            help_icon(row, key).pack(side="right", padx=(ui.SPACE_S, 0))
         return control
 
     def build(self):
@@ -185,6 +196,30 @@ class StereoApp:
 
     def show_page(self,key):
         self.workflow.select(self.workflow_pages[key])
+
+    def save_preference(self,key):
+        """Interface preferences do not wait for the next connection: they are stored at once."""
+        path=self.directory/"settings.json"
+        try:
+            data=json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data,dict):data={"settings_version":3}
+        except (OSError,ValueError):
+            data={"settings_version":3}
+        data[key]=self.vars[key].get()
+        try:
+            path.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
+            return True
+        except OSError:
+            self.status.set("Не удалось сохранить настройку оформления.")
+            return False
+
+    def change_theme(self):
+        if self.save_preference("theme"):
+            self.status.set(f"Тема «{self.vars['theme'].get()}» применится при следующем запуске программы.")
+
+    def change_animations(self):
+        ui.set_animations(self.root,self.vars["animations"].get())
+        self.save_preference("animations")
 
     def toggle_depth(self):
         self.depth_enabled.set(not self.depth_enabled.get())
@@ -219,8 +254,8 @@ class StereoApp:
         self.connection_badge.set("Камеры подключены" if self.connected else "Подключаю камеры…" if self.connection_pending else "Камеры не подключены")
         self.calibration_badge.set("Калибровка не нужна" if is_tof and calibrated else
                                    "Калибровка готова" if calibrated else "Калибровка не загружена")
-        self.connection_label.configure(style="Success.TLabel" if self.connected else "Badge.TLabel")
-        self.calibration_label.configure(style="Success.TLabel" if calibrated else "Badge.TLabel")
+        ui.set_badge_style(self.connection_label,"Success.TLabel" if self.connected else "Badge.TLabel")
+        ui.set_badge_style(self.calibration_label,"Success.TLabel" if calibrated else "Badge.TLabel")
         if calibrated:self.camera_measurement.grid()
         else:self.camera_measurement.grid_remove()
         if not self.connected:
@@ -563,7 +598,8 @@ class StereoApp:
         self.panels[2].set(color)
         low, high = frame.color_limits or (.05, self.worker.max_depth)
         extra = f" · оценено {frame.preview_filled.mean():.1%}" if smooth and frame.preview_filled is not None else ""
-        self.depth_legend_label.configure(foreground="#a02b20" if frame.quality_warning else "#1b293a")
+        colors = ui.palette()
+        self.depth_legend_label.configure(foreground=colors.danger if frame.quality_warning else colors.muted)
         self.depth_legend.set(frame.quality_warning or
                              f"Цвета: {low:.2f}–{high:.2f} м · измерено {frame.valid.mean():.0%}{extra}")
 

@@ -3,19 +3,24 @@ from datetime import datetime
 import json
 from pathlib import Path
 from queue import Empty, Queue
+import sqlite3
 from types import SimpleNamespace
 from threading import Thread
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
 
 from .body_measure import MIN_KEYPOINT_SCORE, MIN_SAMPLES, SKELETON
 from .gpu_pack import DOWNLOAD_SIZE_GB, gpu_pack_ready, install_gpu_pack, nvidia_present
+from .people_database import CLOTHING, PeopleDatabase, SEXES, export_csv, make_entry, summarize, summary_text
 from .people_detection import DOWNLOAD_SIZE_MB, download_models, models_ready
-from .ui import Foldout, note
+from .ui import note
+from .version import VERSION
+from .weighing import person_result
 
+NO_VALUE = "—"
 OUTLINE_OPACITY = .35
 SHOWN_EXPERIMENTS = 30
 HISTORY_REFRESH_MS = 700
@@ -111,22 +116,37 @@ class WeighingTab:
         self.shown = None
         self.downloads = Queue()
         self.downloading = False
+        self.database = PeopleDatabase(app.directory)
+        self.database_entries = []
+        self.sources = {}
+        self.history_items = []
         self.message = tk.StringVar(value="Откройте вкладку после подключения и калибровки камер.")
         self.report = tk.StringVar(value="")
+        self.metric_weight = tk.StringVar(value=NO_VALUE)
+        self.metric_height = tk.StringVar(value=NO_VALUE)
         heading(sidebar, "Взвесим людей", "Встаньте целиком в кадр в 2–3 м от камеры и в метре от стены, "
                 "разведите руки и медленно повернитесь на месте. Нужна облегающая одежда: свободная завышает вес.")
-        note(sidebar, "Вес — приблизительная оценка по объёму тела, с весами не сверялась. "
-                      "Номера действуют только в этом сеансе; лица не распознаются.")
-        ttk.Label(sidebar, textvariable=self.message, style="Section.TLabel", wraplength=280).pack(anchor="w", pady=(8, 4))
+        self.build_metrics(sidebar)
+        ttk.Label(sidebar, textvariable=self.message, style="Muted.TLabel", wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(0, 6))
         ttk.Label(sidebar, textvariable=self.report, wraplength=280, justify="left").pack(anchor="w", fill="x")
+        ttk.Separator(sidebar).pack(fill="x", pady=12)
+        self.build_entry_form(sidebar, action)
+        note(sidebar, "Вес — приблизительная оценка по объёму тела. Номера действуют только в этом сеансе; "
+                      "лица не распознаются, снимки не сохраняются.")
         self.download_button = action(footer, f"Скачать модели ({DOWNLOAD_SIZE_MB} МБ)", self.start_download, primary=True)
         self.reset_button = action(footer, "Начать замеры заново", lambda: app.send("weighing_reset"), "calibrated")
         self.save_button = action(footer, "Сохранить результат", self.save, "calibrated")
         self.gpu_button = action(footer, f"Ускорить на видеокарте ({DOWNLOAD_SIZE_GB} ГБ)", self.start_gpu_install)
-        self.build_history(sidebar)
-        self.panel = panel_class(view, "Люди в кадре", empty="Здесь появятся найденные люди",
+        self.views = ttk.Notebook(view, style="Inner.TNotebook")
+        self.views.pack(fill="both", expand=True)
+        camera_page = ttk.Frame(self.views)
+        self.views.add(camera_page, text="Камера")
+        self.panel = panel_class(camera_page, "Люди в кадре", empty="Здесь появятся найденные люди",
                                  hint="Подключите камеры и встаньте в кадр")
         self.panel.pack(fill="both", expand=True)
+        self.build_history_page(action)
+        self.build_database_page(action)
+        self.refresh_sources()
         self.available = models_ready(app.directory)
         app.workflow.bind("<<NotebookTabChanged>>", self.tab_changed, add="+")
         self.show_download_state()
@@ -136,31 +156,205 @@ class WeighingTab:
             # Asking the driver takes a moment, and only matters if the button may be pressed.
             Thread(target=lambda: self.downloads.put(("nvidia", nvidia_present())), daemon=True).start()
 
-    def build_history(self, parent) -> None:
-        self.history_items = []
-        history = Foldout(parent, "Сохранённые эксперименты")
-        history.pack(fill="x", pady=(10, 4))
-        self.history_list = tk.Listbox(history.content, height=7, exportselection=False, activestyle="none")
-        self.history_list.pack(fill="x")
-        self.history_list.bind("<<ListboxSelect>>", self.show_experiment)
+    def build_metrics(self, parent) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(4, 10))
+        row.columnconfigure((0, 1), weight=1, uniform="metric")
+        for column, (variable, caption) in enumerate(((self.metric_weight, "вес, оценка"), (self.metric_height, "рост"))):
+            ttk.Label(row, textvariable=variable, style="Metric.TLabel").grid(row=0, column=column, sticky="w")
+            ttk.Label(row, text=caption, style="MetricCaption.TLabel").grid(row=1, column=column, sticky="w")
+
+    def build_entry_form(self, parent, action) -> None:
+        """Real height and weight for a measurement, to build the database."""
+        ttk.Label(parent, text="Настоящие данные", style="Section.TLabel").pack(anchor="w")
+        note(parent, "Камера сравнит свой замер с реальностью, и эти записи пойдут на улучшение расчёта. "
+                     "Записывайте человека только с его согласия; вместо имени подойдёт код.")
+        form = ttk.Frame(parent)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        self.entry_source = tk.StringVar()
+        self.entry_label = tk.StringVar()
+        self.entry_height = tk.StringVar()
+        self.entry_weight = tk.StringVar()
+        self.entry_sex = tk.StringVar(value=SEXES[0])
+        self.entry_clothing = tk.StringVar(value=CLOTHING[0])
+        self.entry_scales = tk.BooleanVar(value=True)
+        self.source_box = ttk.Combobox(form, textvariable=self.entry_source, state="readonly", postcommand=self.refresh_sources)
+        fields = (("Замер", self.source_box),
+                  ("Метка", ttk.Entry(form, textvariable=self.entry_label)),
+                  ("Рост, см", ttk.Entry(form, textvariable=self.entry_height)),
+                  ("Вес, кг", ttk.Entry(form, textvariable=self.entry_weight)),
+                  ("Пол", ttk.Combobox(form, textvariable=self.entry_sex, values=SEXES, state="readonly")),
+                  ("Одежда", ttk.Combobox(form, textvariable=self.entry_clothing, values=CLOTHING, state="readonly")))
+        for row, (caption, control) in enumerate(fields):
+            ttk.Label(form, text=caption).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
+            control.grid(row=row, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(form, text="Вес взят с весов только что", variable=self.entry_scales).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(4, 2))
+        self.entry_feedback = tk.StringVar()
+        action(parent, "Добавить в базу", self.add_to_database, primary=True).pack_configure(pady=(6, 2))
+        ttk.Label(parent, textvariable=self.entry_feedback, wraplength=280, justify="left").pack(anchor="w", fill="x")
+
+    def build_history_page(self, action) -> None:
+        page = ttk.Frame(self.views, padding=8)
+        self.views.add(page, text="Эксперименты")
+        table = ttk.Frame(page)
+        table.pack(side="left", fill="both", expand=True)
+        self.history_list = ttk.Treeview(table, columns=("title",), show="headings", selectmode="browse")
+        self.history_list.heading("title", text="Сохранённые замеры, сначала новые", anchor="w")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.history_list.yview)
+        self.history_list.configure(yscrollcommand=scroll.set)
+        self.history_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        self.history_list.bind("<<TreeviewSelect>>", self.show_experiment)
+        details = ttk.Frame(page, padding=(14, 0, 4, 0), width=330)
+        details.pack(side="left", fill="y")
+        details.pack_propagate(False)
+        action(details, "Записать этот замер в базу", self.use_experiment, primary=False)
         self.history_text = tk.StringVar(value="Выберите эксперимент, чтобы увидеть его числа.")
-        ttk.Label(history.content, textvariable=self.history_text, wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(6, 0))
+        ttk.Label(details, textvariable=self.history_text, wraplength=300, justify="left").pack(anchor="nw", fill="x", pady=(10, 0))
         self.refresh_history()
 
+    def build_database_page(self, action) -> None:
+        page = ttk.Frame(self.views, padding=8)
+        self.views.add(page, text="База людей")
+        self.database_summary = tk.StringVar()
+        ttk.Label(page, textvariable=self.database_summary, wraplength=900, justify="left").pack(anchor="w", fill="x", pady=(0, 8))
+        buttons = ttk.Frame(page)
+        buttons.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Удалить запись", style="Danger.TButton", command=self.delete_entry).pack(side="left")
+        ttk.Button(buttons, text="Сохранить CSV", command=self.export_database).pack(side="right")
+        table = ttk.Frame(page)
+        table.pack(fill="both", expand=True)
+        columns = (("created", "Дата", 130), ("label", "Метка", 150), ("sex", "Пол", 80), ("real_height", "Рост, см", 80),
+                   ("camera_height", "Камера, см", 90), ("real_weight", "Вес, кг", 80), ("camera_weight", "Камера, кг", 90),
+                   ("error", "Ошибка, кг", 90), ("clothing", "Одежда", 100))
+        self.database_table = ttk.Treeview(table, columns=[column[0] for column in columns], show="headings", selectmode="browse")
+        for name, title, width in columns:
+            self.database_table.heading(name, text=title, anchor="w")
+            self.database_table.column(name, width=width, anchor="w", stretch=name == "label")
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self.database_table.yview)
+        self.database_table.configure(yscrollcommand=scroll.set)
+        self.database_table.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        self.refresh_database()
+
+    def refresh_sources(self) -> None:
+        """Measurements that can be paired with real data: live people first, then saved ones."""
+        sources = {}
+        known = self.shown.known if self.shown is not None else {}
+        for track_id, estimate in sorted(known.items()):
+            if estimate.samples:
+                mass = f"{estimate.mass_kg:.0f} кг" if estimate.mass_kg else "без оценки"
+                sources[f"Сейчас · №{track_id} · {mass}"] = person_result(track_id, estimate)
+        for name, data in self.history_items:
+            when = experiment_title(name, dict(people=[])).split("  ")[0]
+            for person in data["people"]:
+                if person.get("samples"):
+                    mass = f"{person['mass_kg']:.0f} кг" if person.get("mass_kg") else "без оценки"
+                    sources[f"{when} · №{person.get('label', '?')} · {mass}"] = person
+        self.sources = sources
+        self.source_box.configure(values=list(sources))
+        if self.entry_source.get() not in sources:
+            self.entry_source.set(next(iter(sources), ""))
+
+    def add_to_database(self) -> None:
+        self.refresh_sources()
+        worker = self.app.worker
+        camera = getattr(getattr(worker, "config", None), "mode", "")
+        try:
+            entry = make_entry(self.sources.get(self.entry_source.get()), self.entry_label.get(), self.entry_height.get(),
+                               self.entry_weight.get(), self.entry_sex.get(), self.entry_clothing.get(),
+                               self.entry_scales.get(), camera, VERSION)
+            self.database.add(entry)
+        except ValueError as error:
+            self.entry_feedback.set(str(error))
+            return
+        except (sqlite3.Error, OSError) as error:
+            self.entry_feedback.set(f"Не удалось записать в базу: {error}")
+            return
+        estimate = entry.estimated_weight_kg
+        self.entry_feedback.set(f"Записано. Камера {estimate:.1f} кг, реально {entry.real_weight_kg:g} кг, "
+                                f"ошибка {entry.weight_error_kg:+.1f} кг." if estimate is not None else
+                                "Записано; в этом замере нет оценки веса.")
+        self.entry_label.set("")
+        self.entry_height.set("")
+        self.entry_weight.set("")
+        self.refresh_database()
+
+    def refresh_database(self) -> None:
+        try:
+            self.database_entries = self.database.entries()
+        except (sqlite3.Error, OSError) as error:
+            self.database_entries = []
+            self.database_summary.set(f"Не удалось открыть базу: {error}")
+            return
+        self.database_summary.set(summary_text(summarize(self.database_entries)))
+        self.database_table.delete(*self.database_table.get_children())
+        number = lambda value, digits=1: f"{value:.{digits}f}" if value is not None else NO_VALUE
+        for entry in self.database_entries:
+            error = entry.weight_error_kg
+            self.database_table.insert("", "end", iid=str(entry.id), values=(
+                entry.created.replace("T", " ")[:16], entry.label or NO_VALUE, entry.sex, f"{entry.real_height_cm:g}",
+                number(entry.estimated_height_cm, 0), f"{entry.real_weight_kg:g}", number(entry.estimated_weight_kg),
+                f"{error:+.1f}" if error is not None else NO_VALUE, entry.clothing))
+
+    def delete_entry(self) -> None:
+        selected = self.database_table.selection()
+        if not selected:
+            self.database_summary.set("Выберите запись в таблице, чтобы удалить её.")
+            return
+        if not messagebox.askyesno("База людей", "Удалить эту запись из базы? Вернуть её будет нельзя.", parent=self.page):
+            return
+        try:
+            self.database.delete(int(selected[0]))
+        except (sqlite3.Error, OSError) as error:
+            self.database_summary.set(f"Не удалось удалить запись: {error}")
+            return
+        self.refresh_database()
+
+    def export_database(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = self.app.directory / "output" / f"people_database_{stamp}.csv"
+        try:
+            count = export_csv(self.database_entries, path)
+        except OSError as error:
+            self.database_summary.set(f"Не удалось сохранить файл: {error}")
+            return
+        self.database_summary.set(f"Сохранено записей: {count}. Файл: {path}")
+
     def refresh_history(self) -> None:
-        selected = self.history_list.curselection()
-        chosen = self.history_items[selected[0]][0] if selected else None
+        selected = self.history_list.selection()
         self.history_items = saved_experiments(self.app.directory)
-        self.history_list.delete(0, "end")
-        for index, (name, data) in enumerate(self.history_items):
-            self.history_list.insert("end", experiment_title(name, data))
-            if name == chosen:
-                self.history_list.selection_set(index)
+        self.history_list.delete(*self.history_list.get_children())
+        names = {name for name, _ in self.history_items}
+        for name, data in self.history_items:
+            self.history_list.insert("", "end", iid=name, values=(experiment_title(name, data),))
+        if selected and selected[0] in names:
+            self.history_list.selection_set(selected[0])
+
+    def selected_experiment(self):
+        selected = self.history_list.selection()
+        return next((item for item in self.history_items if selected and item[0] == selected[0]), None)
 
     def show_experiment(self, event=None) -> None:
-        selected = self.history_list.curselection()
-        if selected:
-            self.history_text.set(experiment_report(self.history_items[selected[0]][1]))
+        experiment = self.selected_experiment()
+        if experiment:
+            self.history_text.set(experiment_report(experiment[1]))
+
+    def use_experiment(self) -> None:
+        """Put the chosen experiment into the form, where the real data is typed."""
+        experiment = self.selected_experiment()
+        if not experiment:
+            self.history_text.set("Сначала выберите эксперимент в списке.")
+            return
+        self.refresh_sources()
+        when = experiment_title(experiment[0], dict(people=[])).split("  ")[0]
+        match = next((title for title in self.sources if title.startswith(when + " ")), None)
+        if match is None:
+            self.history_text.set("В этом эксперименте нет людей с измерениями.")
+            return
+        self.entry_source.set(match)
+        self.entry_feedback.set("Замер выбран. Введите настоящие рост и вес слева.")
 
     def start_gpu_install(self) -> None:
         if self.downloading:
@@ -184,7 +378,7 @@ class WeighingTab:
         if self.available:
             self.download_button.pack_forget()
         elif not self.downloading:
-            self.message.set(f"Для поиска людей нужны две модели, {DOWNLOAD_SIZE_MB} МБ. Они скачиваются один раз "
+            self.message.set(f"Для поиска людей нужны три модели, {DOWNLOAD_SIZE_MB} МБ. Они скачиваются один раз "
                              "и работают на этом компьютере; кадры никуда не передаются.")
 
     def selected(self) -> bool:
@@ -193,6 +387,7 @@ class WeighingTab:
     def tab_changed(self, event=None) -> None:
         if self.selected():
             self.refresh_history()
+            self.refresh_sources()
         self.sync()
 
     def sync(self) -> None:
@@ -207,6 +402,8 @@ class WeighingTab:
                 self.app.send("weighing", wanted)
             if not wanted:
                 self.report.set("")
+                self.metric_weight.set(NO_VALUE)
+                self.metric_height.set(NO_VALUE)
         if self.selected() and self.ready() and not wanted:
             self.message.set("Подключите камеры и подготовьте калибровку на первых вкладках.")
 
@@ -256,10 +453,18 @@ class WeighingTab:
             return
         self.shown = state
         self.message.set(state.message + (f" · {state.fps:.1f} кадра/с" if state.fps else ""))
+        self.show_metrics(state)
         self.report.set("\n\n".join(person_report(person.track_id, person.estimate) for person in state.people)
                         or f"Нужно минимум {MIN_SAMPLES} кадров с видимым туловищем.")
         if state.image is not None:
             self.panel.set(draw_people(state.image, state))
+
+    def show_metrics(self, state) -> None:
+        """Large figures for the person measured most; several people are listed in the report."""
+        people = sorted(state.people, key=lambda person: -person.estimate.samples)
+        estimate = people[0].estimate if people else None
+        self.metric_weight.set(f"~{estimate.mass_kg:.0f} кг" if estimate and estimate.mass_kg else NO_VALUE)
+        self.metric_height.set(f"{estimate.height_m * 100:.0f} см" if estimate and estimate.height_m else NO_VALUE)
 
     def save(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

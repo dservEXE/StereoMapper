@@ -10,6 +10,7 @@ import numpy as np
 
 from .calibration import write_image
 from .help_ui import help_icon
+from . import ui
 
 
 class PrecisionWindow:
@@ -17,6 +18,7 @@ class PrecisionWindow:
         from .app import ImagePanel
         self.root, self.result = Path(directory), result
         self.window = tk.Toplevel(parent)
+        ui.style_window(self.window)
         self.window.title("Листья и мелкие детали · точный снимок")
         self.window.geometry("1180x900")
         self.points, self.crop, self.value, self.saved = [], None, None, None
@@ -26,29 +28,34 @@ class PrecisionWindow:
         self.kind = tk.StringVar(value="Длина")
         self.reference = tk.StringVar()
         self.message = tk.StringVar(value="Выберите две точки на снимке. Колесо — увеличение, «Весь кадр» — сброс.")
-        header = ttk.Frame(self.window, padding=12)
+        header = ttk.Frame(self.window, padding=(ui.SPACE_L, ui.SPACE_S, ui.SPACE_M, ui.SPACE_S))
         header.pack(fill="x")
-        ttk.Label(header, text="Измерение листа", font=("Segoe UI", 18, "bold")).pack(side="left")
+        ttk.Label(header, text="Измерение листа", style="Heading.TLabel").pack(side="left")
         help_icon(header, "precision").pack(side="left", padx=8)
-        ttk.Button(header, text="Весь кадр", command=self.reset_zoom).pack(side="right")
-        ttk.Button(header, text="Выбрать точки заново", command=self.clear).pack(side="right", padx=6)
-        self.panel = ImagePanel(self.window, "Полное разрешение · две точки задают прямой отрезок в 3D", self.pick)
-        self.panel.pack(fill="both", expand=True, padx=12)
+        ttk.Button(header, text="Весь кадр", style="Toolbar.TButton", command=self.reset_zoom).pack(side="right")
+        ttk.Button(header, text="Выбрать точки заново", style="Toolbar.TButton", command=self.clear).pack(side="right", padx=ui.SPACE_S)
+        view = ttk.Frame(self.window, style="App.TFrame", padding=ui.SPACE_M)
+        view.pack(fill="both", expand=True)
+        self.panel = ImagePanel(view, "Полное разрешение · две точки задают прямой отрезок в 3D", self.pick)
+        self.panel.pack(fill="both", expand=True)
         self.panel.canvas.bind("<MouseWheel>", self.zoom)
-        controls = ttk.Frame(self.window, padding=12)
+        controls = ttk.Frame(self.window, padding=(ui.SPACE_L, ui.SPACE_M))
         controls.pack(fill="x")
         for title, variable in (("Растение", self.plant), ("Лист", self.leaf)):
-            ttk.Label(controls, text=title).pack(side="left", padx=(0, 4))
-            ttk.Entry(controls, textvariable=variable, width=16).pack(side="left", padx=(0, 12))
+            ttk.Label(controls, text=title).pack(side="left", padx=(0, ui.SPACE_S))
+            ttk.Entry(controls, textvariable=variable, width=14).pack(side="left", padx=(0, ui.SPACE_M))
         ttk.Combobox(controls, textvariable=self.kind, values=("Длина", "Ширина", "Эталон"), width=12,
-                     state="readonly").pack(side="left", padx=6)
-        ttk.Label(controls, text="Настоящий размер эталона, мм:").pack(side="left", padx=4)
+                     state="readonly").pack(side="left", padx=(0, ui.SPACE_M))
+        ttk.Label(controls, text="Настоящий размер эталона, мм:").pack(side="left", padx=(0, ui.SPACE_S))
         ttk.Entry(controls, textvariable=self.reference, width=8).pack(side="left")
-        ttk.Button(controls, text="Сохранить измерение", command=self.save).pack(side="right")
-        ttk.Label(self.window, textvariable=self.message, wraplength=1140, foreground="#146f72").pack(anchor="w", padx=14, pady=5)
-        ttk.Label(self.window, text="Цель: различать 1 мм. Точность пока не подтверждена эталоном. Повторяемость пяти кадров не равна абсолютной точности.\n"
+        ttk.Button(controls, text="Сохранить измерение", style="Accent.TButton", command=self.save).pack(side="right")
+        message = ttk.Label(self.window, textvariable=self.message, wraplength=1140, style="Accent.TLabel")
+        message.pack(anchor="w", padx=ui.SPACE_L, pady=(0, ui.SPACE_XS))
+        caveat = ttk.Label(self.window, text="Цель: различать 1 мм. Точность пока не подтверждена эталоном. Повторяемость пяти кадров не равна абсолютной точности.\n"
                   "Прямой отрезок не равен длине изогнутого листа по поверхности. Сглаженные и предполагаемые точки исключены.",
-                  wraplength=1140, foreground="#5f7185").pack(anchor="w", padx=14, pady=(0, 12))
+                  wraplength=1140, style="CardInfo.TLabel")
+        caveat.pack(anchor="w", padx=ui.SPACE_L, pady=(0, ui.SPACE_M))
+        ui.fit_wrap(self.window, message, caveat, margin=ui.SPACE_L * 2)
         self.redraw()
 
     def redraw(self):
