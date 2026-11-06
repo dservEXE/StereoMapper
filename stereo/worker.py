@@ -501,6 +501,7 @@ class CameraWorker(Thread):
                     pass
                 if self.pending_capture is not None and captured_at >= self.pending_capture:
                     self.pending_capture = None
+                    self.emit("capture_taken", None)
                     try:
                         self.command("capture")
                     except Exception as error:

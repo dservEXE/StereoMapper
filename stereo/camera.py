@@ -156,7 +156,8 @@ def capture_profiles(config):
     profiles = []
     for backend in backends:
         formats = ["MJPG", "native"]
-        rates=(config.fps,30,min(config.fps,15)) if config.fps>30 else (config.fps,min(config.fps,15))
+        # Some drivers accept 15 fps but deliver frames only at 30 fps.
+        rates = (config.fps, 30, min(config.fps, 15))
         for fps in dict.fromkeys(rates):
             profiles.extend((backend, fmt, fps) for fmt in formats)
     return profiles

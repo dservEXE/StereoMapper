@@ -8,6 +8,8 @@ from tkinter import ttk
 import numpy as np
 from PIL import Image
 
+from .calibration_ui import CalibrationShortcuts, StereoPreview
+
 
 @dataclass(frozen=True)
 class BoardSpec:
@@ -41,7 +43,8 @@ def board_image(spec, cell_pixels, border_pixels=None):
 
 
 class BoardWindow:
-    def __init__(self, parent, directory, spec, on_apply=None, on_capture=None, counter_var=None):
+    def __init__(self, parent, directory, spec, on_apply=None, on_capture=None, counter_var=None,
+                 status_var=None, shortcuts=None):
         self.directory, self.on_apply, self.on_capture = Path(directory), on_apply, on_capture
         self.window = tk.Toplevel(parent)
         self.window.title("Экранная калибровочная доска")
@@ -49,6 +52,7 @@ class BoardWindow:
         self.window.minsize(760, 600)
         self.fullscreen = False
         self.closed = False
+        self.capture_status = status_var if status_var is not None else tk.StringVar(master=self.window)
         self.spec = spec.validate()
         self.columns, self.rows = tk.StringVar(value=str(spec.columns)), tk.StringVar(value=str(spec.rows))
         self.square = tk.StringVar(value=f"{spec.square_mm:g}")
@@ -82,7 +86,8 @@ class BoardWindow:
         ttk.Button(action, text="Применить для калибровки", command=self.apply).pack(side="left", padx=3)
         ttk.Button(action, text="Сохранить PNG для печати", command=self.save_png).pack(side="left", padx=3)
         if on_capture:
-            ttk.Button(action, text="Снять пару · пробел", command=self.capture).pack(side="left", padx=3)
+            self.capture_button = ttk.Button(action, text="Снять пару · пробел / S", command=self.capture)
+            self.capture_button.pack(side="left", padx=3)
         if counter_var is not None:
             ttk.Label(action, textvariable=counter_var).pack(side="left", padx=12)
         self.message_label = ttk.Label(self.controls, textvariable=self.message, wraplength=1100)
@@ -90,12 +95,19 @@ class BoardWindow:
         self.controls.bind("<Configure>", lambda event: self.message_label.configure(wraplength=max(200, event.width - 30)))
         self.canvas = tk.Canvas(self.window, background="white", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
+        self.preview = StereoPreview(self.canvas, counter_var)
+        self.preview.place(relx=1, x=-12, y=12, anchor="ne")
         self.canvas.bind("<Configure>", lambda event: self.draw())
         self.window.bind("<F11>", lambda event: self.toggle_fullscreen())
         self.window.bind("<Escape>", lambda event: self.toggle_fullscreen() if self.fullscreen else self.close())
-        self.window.bind("<space>", self.key_capture)
+        self.shortcuts = shortcuts or CalibrationShortcuts(
+            self.window, lambda window: self.capture(), lambda window: window is self.window)
+        self.shortcuts.add_window(self.window)
+        self.status_trace = self.capture_status.trace_add("write", lambda *args: self.draw())
+        self.window.bind("<Destroy>", self.on_destroy, add="+")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.draw()
+        self.window.after_idle(self.canvas.focus_set)
 
     def load_scale(self):
         try:
@@ -153,10 +165,12 @@ class BoardWindow:
         self.canvas.create_text(width / 2, baseline - 19, text=f"Контрольная линия ≈100 мм · {verified}", fill="#333")
         self.fit_message = "" if fits else "НЕ ПОМЕЩАЕТСЯ: полный экран или «Вписать в экран»"
         caption = (f"{self.spec.columns} × {self.spec.rows} внутренних углов · клетка ≈{self.effective_spec.square_mm:.2f} мм "
-                   f"({cell} px) · пробел: снимок · F11: полный экран · Esc: назад")
+                   f"({cell} px) · пробел / S: снимок · F11: полный экран · Esc: назад")
+        caption = self.capture_status.get() or caption
         if self.fit_message:
             caption = self.fit_message
-        self.canvas.create_text(width / 2, height - 14, text=caption, fill="#a00000" if not fits else "#333")
+        self.canvas.create_text(width / 2, height - 20, text=caption, width=max(120, width - 32),
+                                fill="#a00000" if not fits else "#333")
 
     def fit(self):
         try:
@@ -199,15 +213,12 @@ class BoardWindow:
         return True
 
     def capture(self):
-        if self.apply() and self.on_capture:
-            if not self.on_capture():
-                self.message.set("Сначала подключите камеры в основном окне.")
-
-    def key_capture(self, event):
-        if isinstance(event.widget, (ttk.Entry, tk.Entry)):
-            return
-        self.capture()
-        return "break"
+        if not self.apply():
+            self.capture_status.set(self.message.get())
+            return False
+        if self.on_capture:
+            return self.on_capture()
+        return False
 
     def save_png(self):
         if not self.generate():
@@ -233,6 +244,12 @@ class BoardWindow:
             self.controls.pack(fill="x", before=self.canvas)
         self.window.attributes("-fullscreen", self.fullscreen)
         self.window.lift()
+        self.canvas.focus_set()
+
+    def on_destroy(self, event):
+        if event.widget is self.window:
+            self.closed = True
+            self.capture_status.trace_remove("write", self.status_trace)
 
     def close(self):
         self.closed = True

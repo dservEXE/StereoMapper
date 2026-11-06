@@ -16,6 +16,7 @@ from .depth import measure
 from .worker import CameraWorker
 from .viewer import CloudViewer
 from .board import BoardSpec, BoardWindow
+from .calibration_ui import CalibrationShortcuts
 from .help_ui import help_icon, HELP
 from .presets import PRESETS
 from .ui import NIGHT
@@ -90,7 +91,7 @@ class StereoApp:
         self.settings_controls = []
         self.connected = False
         self.closing = False
-        self.hidden_for_capture = False
+        self.capture_pending = False
         self.capture_generation = 0
         self.status = tk.StringVar(value="F1 — краткая инструкция · ? — подсказка к настройке")
         self.calibration_text = tk.StringVar(value="Калибровки нет — расстояния пока недоступны")
@@ -106,7 +107,6 @@ class StereoApp:
         self.smooth_depth = tk.BooleanVar(value=False)
         self.depth_legend = tk.StringVar(value="Тёмные участки: достоверной глубины нет")
         self.guides = tk.BooleanVar(value=True)
-        self.hide_capture = tk.BooleanVar(value=True)
         self.vars = {"left": tk.StringVar(value="0"), "right": tk.StringVar(value="1"),
                      "width": tk.StringVar(value="640"), "height": tk.StringVar(value="480"),
                      "fps": tk.StringVar(value="15"), "backend": tk.StringVar(value="AUTO"),
@@ -123,6 +123,9 @@ class StereoApp:
         self.vars['ghost_filter']=tk.StringVar(value="Обычная")
         self.load_settings()
         self.build()
+        self.capture_shortcuts = CalibrationShortcuts(
+            self.root, self.capture_from_window, self.is_calibration_window)
+        self.capture_shortcuts.add_window(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll_id=self.root.after(40, self.poll)
         self.root.bind("<Destroy>",self.on_destroy,add="+")
@@ -192,12 +195,13 @@ class StereoApp:
         frame=bool(worker and getattr(worker,"frame",None) is not None)
         scan_active=bool(worker and getattr(worker,"scan",None) is not None) or bool(self.scan_window and self.scan_window.window.winfo_exists() and self.scan_window.active)
         signature=(self.connected,self.connection_pending,calibrated,frame,self.depth_enabled.get(),
-                   self.mapping.get(),self.calibration_pairs,self.calibration_busy,scan_active,self.workflow.select())
+                   self.mapping.get(),self.calibration_pairs,self.calibration_busy,scan_active,
+                   self.capture_pending,self.workflow.select())
         if signature==self.ui_signature and not force:return
         self.ui_signature=signature
         available=dict(connected=self.connected and not self.calibration_busy,
                        calibrated=calibrated and not self.calibration_busy,
-                       capture=self.connected and not self.calibration_busy and not self.hidden_for_capture,
+                       capture=self.connected and not self.calibration_busy and not self.capture_pending,
                        calibrate=self.connected and self.calibration_pairs>=15 and not self.calibration_busy,
                        frame=frame)
         for control,capability in self.ui_actions:
@@ -398,29 +402,54 @@ class StereoApp:
         if path:
             self.send("load", path)
 
+    def is_calibration_window(self, window):
+        if self.closing:
+            return False
+        if self.board_window and not self.board_window.closed and window is self.board_window.window:
+            return True
+        return window is self.root and self.workflow.select() == str(self.workflow_pages["calibration"])
+
+    def capture_from_window(self, window):
+        if self.board_window and not self.board_window.closed and window is self.board_window.window:
+            return self.board_window.capture()
+        return self.capture_calibration()
+
+    def set_capture_preview_hidden(self, hidden):
+        if self.board_window and not self.board_window.closed:
+            self.board_window.preview.set_hidden(hidden)
+
     def capture_calibration(self):
         if not self.connected:
             self.status.set("Сначала подключите камеры.")
             return False
+        if self.capture_pending:
+            return False
+        if self.calibration_busy:
+            self.status.set("Дождитесь завершения расчёта калибровки.")
+            return False
+        if self.connection_pending or not self.worker or not self.worker.is_alive():
+            self.status.set("Дождитесь подключения камер.")
+            return False
+        if self.worker.scan is not None:
+            self.status.set("Завершите объёмный снимок перед съёмкой калибровочной пары.")
+            return False
+        self.capture_pending = True
         self.status.set("Остановите камеру и доску. Снимок будет сделан через секунду.")
-        self.hidden_for_capture = self.hide_capture.get()
-        if self.hidden_for_capture:
-            self.root.withdraw()
+        self.set_capture_preview_hidden(True)
+        self.root.update_idletasks()
         self.send("capture_after", time.perf_counter() + 1.)
         self.capture_generation += 1
         generation = self.capture_generation
         self.root.after(10000, lambda: self.capture_timeout(generation))
+        self.sync_ui(force=True)
         return True
 
     def restore_visibility(self):
-        if self.hidden_for_capture:
-            self.hidden_for_capture = False
-            self.root.deiconify()
-            if self.board_window and not self.board_window.closed:
-                self.board_window.window.lift()
+        self.capture_pending = False
+        self.set_capture_preview_hidden(False)
 
     def capture_timeout(self, generation):
-        if self.hidden_for_capture and generation == self.capture_generation:
+        if self.capture_pending and generation == self.capture_generation:
             self.send("cancel_capture")
             self.restore_visibility()
             self.status.set("Съёмка заняла слишком долго. Пара отменена; проверьте камеру и повторите.")
@@ -458,7 +487,11 @@ class StereoApp:
             spec = BoardSpec(int(self.vars["columns"].get()), int(self.vars["rows"].get()),
                              float(self.vars["square_mm"].get().replace(",", "."))).validate()
             self.board_window = BoardWindow(self.root, self.directory, spec, self.apply_board,
-                                             self.capture_calibration, self.count)
+                                             self.capture_calibration, self.count,
+                                             status_var=self.status, shortcuts=self.capture_shortcuts)
+            if self.preview_last is not None:
+                self.board_window.preview.set_frames(self.preview_last["raw"])
+            self.board_window.preview.set_hidden(self.capture_pending)
         except (ValueError, OSError, tk.TclError) as error:
             messagebox.showerror("Доска", str(error))
 
@@ -574,6 +607,8 @@ class StereoApp:
                         else:
                             message+='\nДобавьте положения по краям кадра и разные расстояния; замирайте перед снимком.'
                         self.calibration_hint.set(message)
+                    elif kind == "capture_taken":
+                        self.set_capture_preview_hidden(False)
                     elif kind == "capture_finished":
                         self.restore_visibility()
                     elif kind == "calibration":
@@ -702,6 +737,8 @@ class StereoApp:
         self.panels[0].set(images[0])
         self.panels[1].set(images[1])
         self.calibration_panel.set(images[0])
+        if self.board_window and not self.board_window.closed:
+            self.board_window.preview.set_frames(images)
         self.preview_last = {"raw": raw, "calibration_token": token, "captured": captured,
                              "sequence": sequence}
 
