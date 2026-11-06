@@ -153,6 +153,10 @@ def build(app):
     ttk.Label(overview,textvariable=app.tracking,style="CardInfo.TLabel",wraplength=650).pack(fill="x",pady=(8,0))
     app.panels=[left,right,depth,overview]
 
+    weighing,views=page("weighing","4  Взвешивание")
+    from .weighing_ui import WeighingTab
+    app.weighing_tab=WeighingTab(app,app.workflow_pages["weighing"],weighing,views,app.ui_footers["weighing"],heading,action,ImagePanel)
+
     advanced=ttk.Frame(app.workflow,style="App.TFrame"); app.workflow.add(advanced,text="Дополнительно")
     app.workflow_pages["advanced"]=advanced
     tools=ScrolledFrame(advanced,style="Card.TFrame",width=350); tools.pack(side="left",fill="y",padx=(0,12)); tools.pack_propagate(False)

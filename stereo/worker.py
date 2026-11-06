@@ -21,6 +21,7 @@ from .ghost_filter import MultiViewConfirmation
 from .cloud_orientation import initial_camera_pose
 from .maixsense import MaixSensePump, TOF_MODE
 from .tof_engine import TofEngine, TOF_MAX_RANGE_M, tof_precision_snapshot
+from .weighing import WeighingSession
 
 STEREO_ONLY_COMMANDS = {"capture", "capture_after", "calibrate", "new_series", "load",
                         "restore_series", "board_settings"}
@@ -39,6 +40,7 @@ class CameraWorker(Thread):
         self.root, self.config = Path(root), config
         self.is_tof = config.mode == TOF_MODE
         self.signal_filter = signal_filter
+        self.weighing = None
         if self.is_tof:
             max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
         self.log_path=self.root/"data"/"logs"/f"events_{stamp()}.jsonl"
@@ -172,6 +174,26 @@ class CameraWorker(Thread):
         self.frame = None
         self.reset_map()
 
+    def start_weighing(self):
+        if self.engine is None:
+            raise ValueError("Для взвешивания сначала нужна калибровка.")
+        if self.scan:
+            raise ValueError("Завершите объёмный снимок перед взвешиванием.")
+        if self.weighing is None:
+            from .people_detection import PersonDetector
+            self.weighing = WeighingSession(lambda status: PersonDetector(self.root, status),
+                                            lambda message: self.emit("status", message))
+            self.weighing.start()
+        if not self.depth_enabled:
+            self.depth_enabled = True
+            self.emit("depth_enabled", True)
+
+    def stop_weighing(self):
+        if self.weighing is not None:
+            self.weighing.stop_event.set()
+            self.weighing.join(timeout=5)
+            self.weighing = None
+
     def command(self, name, value=None):
         is_tof = getattr(self, "is_tof", False)
         if is_tof and name in STEREO_ONLY_COMMANDS:
@@ -180,7 +202,7 @@ class CameraWorker(Thread):
             raise ValueError("MaixSense измеряет глубину сама: стереокалибровка и съёмка доски ей не нужны.")
         if self.calibration_busy and name in ('calibrate','capture','new_series','board_settings','load','restore_series','precision','scan_start'):
             raise ValueError("Расчёт калибровки ещё идёт; дождитесь результата. Видео продолжает работать.")
-        if self.scan and name not in ('scan_stop','scan_extend','distance_report'):
+        if self.scan and name not in ('scan_stop','scan_extend','distance_report','weighing','weighing_reset','weighing_save'):
             raise ValueError("Идёт объёмный снимок. Завершите его в окне накопления перед этой операцией.")
         if name == "depth":
             if value and self.engine is None:
@@ -197,6 +219,20 @@ class CameraWorker(Thread):
             if self.engine:
                 self.engine.estimate_surfaces = self.estimate_surfaces
             self.emit("status", "Оценка поверхностей включена" if value else "Оценка поверхностей выключена; нагрузка уменьшена")
+        elif name == "weighing":
+            if value:
+                self.start_weighing()
+            else:
+                self.stop_weighing()
+        elif name == "weighing_reset":
+            if self.weighing:
+                self.weighing.reset()
+                self.emit("status", "Замеры начаты заново; номера людей выданы заново.")
+        elif name == "weighing_save":
+            if not self.weighing:
+                raise ValueError("Откройте вкладку взвешивания и дождитесь замеров.")
+            count = self.weighing.save(value)
+            self.emit("status", f"Результат сохранён, людей: {count}. Файл: {value}")
         elif name == "signal_filter":
             self.signal_filter = bool(value)
             if is_tof and self.engine:
@@ -305,6 +341,7 @@ class CameraWorker(Thread):
             if not self.engine or self.raw is None:
                 raise ValueError("Для объёмного снимка нужна калибровка этого разрешения.")
             from .object_scan import ObjectScan
+            self.stop_weighing()
             self.mapping=self.depth_enabled=False
             self.emit("mapping",False)
             self.emit("depth_enabled",False)
@@ -573,6 +610,8 @@ class CameraWorker(Thread):
                     self.frame = self.engine.compute(*self.raw)
                     self.frame_raw = self.raw
                     self.depth_frames += 1
+                    if self.weighing:
+                        self.weighing.submit(self.frame, self.engine.calibration.P1[:, :3])
                     did_compute = True
                     depth_ms = (time.perf_counter() - depth_started) * 1000
                     local = self.frame.points[::4, ::4].reshape(-1, 3)
@@ -630,6 +669,7 @@ class CameraWorker(Thread):
                           "tracking_ms":tracking_ms,"insert_ms":insert_ms,"map_render_ms":self.map_render_ms,
                           "map_archive":str(self.cloud.path) if self.cloud.path else None,
                           "capture": self.capture_info, "capture_fps": camera.fps,
+                          "weighing": self.weighing.snapshot() if self.weighing else None,
                           "depth_enabled": self.depth_enabled, "restart_count": camera.restart_count,
                           "estimated_map_count": len(self.estimated_cloud.cells),
                           "discarded_stereo_pairs": max(0, sequence - self.processed_frames - 1),
@@ -651,6 +691,7 @@ class CameraWorker(Thread):
                     self.finish_scan("Камеры отключены. Сохранены ранее подтверждённые точки.")
                 except Exception as error:
                     self.emit("error",f"Сохранение объёмного снимка: {error}")
+            self.stop_weighing()
             if self.map_integrator:
                 self.map_integrator.stop_event.set()
                 self.map_integrator.join()

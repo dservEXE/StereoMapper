@@ -729,6 +729,7 @@ class StereoApp:
             except Empty:
                 pass
             self.show_preview()
+        self.weighing_tab.poll(self.packet)
         if self.closing:
             if not self.worker or not self.worker.is_alive():
                 self.root.destroy()

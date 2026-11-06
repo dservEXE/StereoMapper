@@ -66,7 +66,7 @@ class AppUXTests(unittest.TestCase):
 
     def test_first_run_has_clear_pages_and_precision_is_only_in_advanced(self):
         self.assertIsNone(self.app.worker)
-        self.assertEqual(list(self.app.workflow_pages),['cameras','calibration','scan','advanced'])
+        self.assertEqual(list(self.app.workflow_pages),['cameras','calibration','scan','weighing','advanced'])
         self.assertEqual(self.app.workflow.select(),str(self.app.workflow_pages['cameras']))
         self.assertFalse(self.app.precision_button.winfo_viewable())
         self.assertTrue(self.enabled(self.app.connect_button))

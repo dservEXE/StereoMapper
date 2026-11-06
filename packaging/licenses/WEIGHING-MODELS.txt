@@ -1,0 +1,6 @@
+Models for the weighing tab. They are not bundled: the application downloads them on request
+from huggingface.co, at the pinned revisions below, and checks each weights file by SHA-256.
+
+RT-DETR R18vd, PekingU/rtdetr_r18vd, Apache-2.0
+ViTPose+ small, usyd-community/vitpose-plus-small, Apache-2.0
+SlimSAM uniform-77, Zigeng/SlimSAM-uniform-77, Apache-2.0
