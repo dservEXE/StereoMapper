@@ -1,4 +1,5 @@
 """Person measuring, tracking and the weighing tab, on a synthetic person of known size."""
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import time
 import tkinter as tk
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import cv2
 import numpy as np
@@ -23,9 +25,10 @@ from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, HANDS_FEET
 from stereo.people_detection import (DETECTOR, DOWNLOAD_SIZE_MB, SEGMENTER, SOURCES, crop_matrix, decode_heatmaps, download_models,
                                      model_path, models_ready, peak, pose_crop)
 from stereo.people_tracking import PersonTracker, box_iou
+from stereo.gpu_pack import WHEEL_SHA256, WHEEL_URL, gpu_pack_ready, install_gpu_pack
 from stereo.weighing import WeighingSession
 from stereo.worker import CameraWorker
-from stereo.weighing_ui import draw_people, person_report
+from stereo.weighing_ui import draw_people, experiment_report, experiment_title, person_report, saved_experiments
 
 WIDTH, HEIGHT = 960, 720
 K = np.array([[600., 0, 480], [0, 600., 360], [0, 0, 1]])
@@ -239,6 +242,16 @@ class SliceTests(unittest.TestCase):
         sample = sample_at()._replace(slice_widths=tuple(row), slice_split=(False,) * SLICES)
         self.assertAlmostEqual(float(slice_profile([sample] * 6)[16]), .46, places=3)
 
+    def test_level_the_outline_missed_is_filled_from_its_neighbours_not_counted_as_nothing(self):
+        # As in a saved experiment: the top quarter of the front profile read as zero.
+        mask = np.zeros((320, 300), bool)
+        mask[80:320, 120:180] = True
+        widths, _ = body_slices(mask, (150., 0.), (150., 320.), 140, 1.)
+        self.assertTrue(math.isnan(widths[0]))
+        sample = sample_at()._replace(slice_widths=widths, slice_split=(False,) * SLICES)
+        profile = slice_profile([sample] * 6)
+        self.assertAlmostEqual(float(profile[0]), 60, delta=2)
+
     def test_a_bust_or_buttocks_adds_volume_only_where_it_is(self):
         flat = np.full(SLICES, .30)
         side = np.full(SLICES, .20)
@@ -305,14 +318,32 @@ class EstimateTests(unittest.TestCase):
         self.assertIsNone(estimate.mass_kg)
         self.assertIn("целиком", estimate.message)
 
-    def test_single_wrong_distance_does_not_change_the_measured_size(self):
+    def test_wrong_distances_do_not_change_the_measured_sizes(self):
         body = BodyAccumulator()
-        for _ in range(10):
+        generator = np.random.default_rng(4)
+        for _ in range(30):
+            reading = sample_at()
+            body.add(rescaled(reading, reading.depth * float(generator.uniform(.85, 1.25))))
+        for sample in body.steady():
+            self.assertAlmostEqual(sample.height, body.steady()[0].height, places=6)
+            self.assertAlmostEqual(sample.widths["torso"] / sample.height, TORSO_WIDTH / TRUE_HEIGHT, delta=.015)
+
+    def test_a_person_walking_keeps_one_size(self):
+        body = BodyAccumulator()
+        for depth in np.linspace(2., 3.2, 25):
+            body.add(sample_at(depth=float(depth), wall=6.))
+        estimate = body.estimate()
+        self.assertAlmostEqual(estimate.height_m, TRUE_HEIGHT, delta=.04)
+        self.assertAlmostEqual(estimate.widths_m["torso"], TORSO_WIDTH, delta=.03)
+
+    def test_frame_with_a_cut_outline_does_not_set_the_scale(self):
+        body = BodyAccumulator()
+        for _ in range(20):
             body.add(sample_at())
         reading = sample_at()
-        body.add(rescaled(reading, reading.depth * 1.4))
-        self.assertAlmostEqual(body.samples[-1].widths["torso"], TORSO_WIDTH, delta=.03)
-        self.assertAlmostEqual(body.samples[-1].depth, 2.5, delta=.01)
+        body.add(reading._replace(height=reading.height * .3))
+        self.assertEqual(len(body.steady()), 20)
+        self.assertAlmostEqual(body.estimate().height_m, TRUE_HEIGHT, delta=.04)
 
     def test_old_samples_are_dropped_so_memory_stays_bounded(self):
         body = BodyAccumulator()
@@ -528,6 +559,16 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn("image", json.dumps(data))
         self.assertEqual(len(data["people"][0]["slices_front_m"]), SLICES)
 
+    def test_chance_detection_without_a_measurement_is_not_saved(self):
+        session = self.run_session()
+        with session.lock:
+            session.state = replace(session.state, known={**session.state.known, 99: BodyAccumulator().estimate()})
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            session.save(path)
+            labels = [person["label"] for person in json.loads(path.read_text(encoding="utf-8"))["people"]]
+        self.assertNotIn(99, labels)
+
     def test_model_loading_failure_is_reported_not_silent(self):
         messages = []
 
@@ -661,6 +702,97 @@ class WorkerCommandTests(unittest.TestCase):
                 self.worker(temp).command("weighing_save", Path(temp) / "r.json")
 
 
+class GpuPackTests(unittest.TestCase):
+    @staticmethod
+    def wheel_bytes():
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as wheel:
+            wheel.writestr("torch/__init__.py", "")
+        return stream.getvalue()
+
+    def install(self, temp, data, sha=None, **kwargs):
+        def opener(request, timeout=None):
+            return io.BytesIO(data[int((request.get_header("Range") or "bytes=0-")[6:-1]):])
+        install_gpu_pack(temp, opener=opener, url="https://example.test/x", size=len(data),
+                         sha256=sha or hashlib.sha256(data).hexdigest(), **kwargs)
+
+    def test_verified_download_is_unpacked_and_the_archive_removed(self):
+        data = self.wheel_bytes()
+        with TemporaryDirectory() as temp:
+            self.assertFalse(gpu_pack_ready(temp))
+            self.install(temp, data)
+            self.assertTrue(gpu_pack_ready(temp))
+            self.assertFalse((Path(temp) / "gpu_runtime.download").exists())
+
+    def test_corrupt_download_is_rejected_and_nothing_is_activated(self):
+        with TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(RuntimeError, "контрольная"):
+                self.install(temp, self.wheel_bytes(), sha="0" * 64)
+            self.assertFalse(gpu_pack_ready(temp))
+            self.assertFalse((Path(temp) / "gpu_runtime.download").exists())
+
+    def test_interrupted_download_continues_where_it_stopped(self):
+        data = self.wheel_bytes()
+        with TemporaryDirectory() as temp:
+            (Path(temp) / "gpu_runtime.download").write_bytes(data[:40])
+            ranges = []
+
+            class Answer(io.BytesIO):
+                status = 206
+
+            def opener(request, timeout=None):
+                ranges.append(request.get_header("Range"))
+                return Answer(data[40:])
+            install_gpu_pack(temp, opener=opener, url="https://example.test/x", size=len(data),
+                             sha256=hashlib.sha256(data).hexdigest())
+            self.assertEqual(ranges, ["bytes=40-"])
+            self.assertTrue(gpu_pack_ready(temp))
+
+    def test_the_pinned_download_is_the_same_torch_version_as_the_runtime(self):
+        self.assertIn("torch-2.14.1", WHEEL_URL)
+        self.assertRegex(WHEEL_SHA256, r"^[0-9a-f]{64}$")
+
+
+class ExperimentHistoryTests(unittest.TestCase):
+    def save(self, temp, stamp, mass=71.4):
+        folder = Path(temp) / "output" / f"weighing_{stamp}"
+        folder.mkdir(parents=True)
+        person = dict(label=1, samples=30, height_m=1.8, widths_m=dict(torso=.3), side_widths_m=dict(torso=.2),
+                      lengths_m={}, volume_l=70., mass_kg=mass, mass_low_kg=60., mass_high_kg=80.,
+                      side_observed=True, views=dict(front=9, side=8))
+        (folder / "result.json").write_text(json.dumps(dict(people=[person])), encoding="utf-8")
+
+    def test_newest_comes_first_and_broken_results_are_skipped(self):
+        with TemporaryDirectory() as temp:
+            self.save(temp, "20261106_100000")
+            self.save(temp, "20261106_120000")
+            broken = Path(temp) / "output" / "weighing_20261106_130000"
+            broken.mkdir()
+            (broken / "result.json").write_text("{not json", encoding="utf-8")
+            names = [name for name, _ in saved_experiments(temp)]
+        self.assertEqual(names, ["weighing_20261106_120000", "weighing_20261106_100000"])
+
+    def test_no_folder_means_no_experiments(self):
+        with TemporaryDirectory() as temp:
+            self.assertEqual(saved_experiments(temp), [])
+
+    def test_title_shows_time_and_mass(self):
+        title = experiment_title("weighing_20261106_215432", dict(people=[dict(mass_kg=40.9)]))
+        self.assertIn("06.11 21:54:32", title)
+        self.assertIn("41 кг", title)
+
+    def test_report_of_a_saved_result_matches_the_live_wording(self):
+        with TemporaryDirectory() as temp:
+            self.save(temp, "20261106_100000")
+            text = experiment_report(saved_experiments(temp)[0][1])
+        self.assertIn("Человек №1", text)
+        self.assertIn("Рост: 180 см", text)
+        self.assertIn("около 71 кг", text)
+
+    def test_result_saved_before_slices_existed_still_opens(self):
+        self.assertIn("Человек №3", experiment_report(dict(people=[dict(label=3)])))
+
+
 class TabTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -730,6 +862,14 @@ class TabTests(unittest.TestCase):
         self.open_tab()
         self.assertEqual(self.sent, [])
         self.assertIn("Подключите", self.tab.message.get())
+
+    def test_saved_experiments_are_listed_and_open_when_chosen(self):
+        ExperimentHistoryTests().save(self.temp.name, "20261106_100000")
+        self.tab.refresh_history()
+        self.assertEqual(self.tab.history_list.size(), 1)
+        self.tab.history_list.selection_set(0)
+        self.tab.show_experiment()
+        self.assertIn("Человек №1", self.tab.history_text.get())
 
     def test_poll_shows_the_latest_state_once(self):
         self.tab.available = True

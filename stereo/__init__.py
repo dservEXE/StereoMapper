@@ -6,6 +6,14 @@ import os
 os.environ["OPENCV_OPENCL_RUNTIME"] = "disabled"
 os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 
+import sys
+from pathlib import Path
+
+# Optional NVIDIA PyTorch from gpu_pack.py: must come before the bundled one on the import path.
+_gpu_runtime = Path(__file__).resolve().parent.parent / "gpu_runtime"
+if (_gpu_runtime / "torch" / "__init__.py").is_file():
+    sys.path.insert(0, str(_gpu_runtime))
+
 import cv2
 
 # OpenCL is independent of the optional NVIDIA CUDA stereo engine. Keep the

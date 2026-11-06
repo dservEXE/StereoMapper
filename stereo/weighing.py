@@ -174,7 +174,7 @@ class WeighingSession(Thread):
                        mass_kg=e.mass_kg, mass_low_kg=e.mass_low_kg, mass_high_kg=e.mass_high_kg,
                        side_observed=e.observed_side, views=e.view_coverage,
                        slices_front_m=e.slices_front_m, slices_side_m=e.slices_side_m)
-                  for track_id, e in sorted(state.known.items())]
+                  for track_id, e in sorted(state.known.items()) if e.samples]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(dict(units="metres, litres, kilograms", validated_against_scales=False,
                                         people=people), ensure_ascii=False, indent=2), encoding="utf-8")

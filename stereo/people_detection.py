@@ -17,7 +17,6 @@ from .body_measure import KEYPOINT_COUNT, MIN_KEYPOINT_SCORE, PersonObservation
 DOWNLOAD_SIZE_MB = 252
 DETECTION_THRESHOLD = .5
 MIN_BOX_PX = 24
-INFERENCE_THREADS = 4
 COCO_DATASET_INDEX = 0
 # Joints that lie inside the body, as hints for the outline. Wrists and the face are left out
 # because a pose model places them less surely when the person turns away.
@@ -144,7 +143,7 @@ def decode_heatmaps(heatmaps, crop) -> tuple:
 
 
 class PersonDetector:
-    """RT-DETR finds people, ViTPose places 17 joints, SlimSAM traces the outline. Runs on the CPU."""
+    """RT-DETR finds people, ViTPose places 17 joints, SlimSAM traces the outline."""
 
     def __init__(self, root, status=lambda message: None):
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -152,20 +151,21 @@ class PersonDetector:
         from transformers import (RTDetrForObjectDetection, RTDetrImageProcessor, SamImageProcessor, SamModel,
                                   SamProcessor, VitPoseForPoseEstimation, VitPoseImageProcessor)
         self.torch = torch
-        # Leave cores for capture and stereo depth.
-        torch.set_num_threads(min(INFERENCE_THREADS, os.cpu_count() or 2))
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # On the card the processor only prepares data. Otherwise use it, leaving room for capture.
+        torch.set_num_threads(2 if self.device == "cuda" else max(2, (os.cpu_count() or 4) - 2))
         options = dict(local_files_only=True)
         detector, pose = model_path(root, DETECTOR), model_path(root, POSE)
         status("Загружаю модели поиска людей…")
         self.detector_processor = RTDetrImageProcessor.from_pretrained(detector, **options)
-        self.detector = RTDetrForObjectDetection.from_pretrained(detector, use_safetensors=True, **options).eval()
+        self.detector = RTDetrForObjectDetection.from_pretrained(detector, use_safetensors=True, **options).eval().to(self.device)
         # Only its settings: its own image steps need SciPy, which the application does not ship.
         self.pose_processor = VitPoseImageProcessor.from_pretrained(pose, **options)
-        self.pose = VitPoseForPoseEstimation.from_pretrained(pose, use_safetensors=True, **options).eval()
+        self.pose = VitPoseForPoseEstimation.from_pretrained(pose, use_safetensors=True, **options).eval().to(self.device)
         segmenter = model_path(root, SEGMENTER)
         self.segment_images = SamImageProcessor.from_pretrained(segmenter, **options)
         self.segment_prompts = SamProcessor(self.segment_images)
-        self.segmenter = SamModel.from_pretrained(segmenter, use_safetensors=True, **options).eval()
+        self.segmenter = SamModel.from_pretrained(segmenter, use_safetensors=True, **options).eval().to(self.device)
         self.person_label = self.detector.config.label2id.get("person", 0)
         self.pose_width = int(self.pose_processor.size["width"])
         self.pose_height = int(self.pose_processor.size["height"])
@@ -173,7 +173,7 @@ class PersonDetector:
         self.pose_std = np.array(self.pose_processor.image_std, np.float32)
 
     def outline(self, bgr, observation) -> np.ndarray | None:
-        """Exact body pixels for one person, from their box and joints. About a second on a CPU."""
+        """Exact body pixels for one person, from their box and joints."""
         hints = [[float(v) for v in observation.keypoints[i]] for i in OUTLINE_HINTS
                  if observation.keypoint_scores[i] >= MIN_KEYPOINT_SCORE]
         if len(hints) < 2:
@@ -182,10 +182,11 @@ class PersonDetector:
         inputs = self.segment_prompts(image, input_boxes=[[list(observation.box)]], input_points=[[hints]],
                                       input_labels=[[[1] * len(hints)]], return_tensors="pt")
         with self.torch.inference_mode():
-            output = self.segmenter(pixel_values=inputs["pixel_values"], input_boxes=inputs["input_boxes"],
-                                    input_points=inputs["input_points"], input_labels=inputs["input_labels"],
-                                    multimask_output=False)
-        masks = self.segment_images.post_process_masks(output.pred_masks, inputs["original_sizes"],
+            output = self.segmenter(pixel_values=inputs["pixel_values"].to(self.device),
+                                    input_boxes=inputs["input_boxes"].to(self.device),
+                                    input_points=inputs["input_points"].to(self.device),
+                                    input_labels=inputs["input_labels"].to(self.device), multimask_output=False)
+        masks = self.segment_images.post_process_masks(output.pred_masks.cpu(), inputs["original_sizes"],
                                                        inputs["reshaped_input_sizes"])
         return masks[0][0, 0].numpy().astype(bool)
 
@@ -194,13 +195,13 @@ class PersonDetector:
         image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         torch = self.torch
         with torch.inference_mode():
-            inputs = self.detector_processor(images=image, return_tensors="pt")
+            inputs = self.detector_processor(images=image, return_tensors="pt").to(self.device)
             found = self.detector_processor.post_process_object_detection(
-                self.detector(**inputs), target_sizes=torch.tensor([(height, width)]),
+                self.detector(**inputs), target_sizes=torch.tensor([(height, width)], device=self.device),
                 threshold=DETECTION_THRESHOLD)[0]
             keep = found["labels"] == self.person_label
-            boxes = found["boxes"][keep].numpy()
-            scores = found["scores"][keep].numpy()
+            boxes = found["boxes"][keep].cpu().numpy()
+            scores = found["scores"][keep].cpu().numpy()
             large = (boxes[:, 2] - boxes[:, 0] >= MIN_BOX_PX) & (boxes[:, 3] - boxes[:, 1] >= MIN_BOX_PX)
             boxes, scores = boxes[large], scores[large]
             if not len(boxes):
@@ -211,9 +212,9 @@ class PersonDetector:
             batch = np.stack([((cv2.warpAffine(rgb, crop_matrix(crop, self.pose_width, self.pose_height),
                                                (self.pose_width, self.pose_height), flags=cv2.INTER_LINEAR)
                                 - self.pose_mean) / self.pose_std).transpose(2, 0, 1) for crop in crops])
-            heatmaps = self.pose(pixel_values=torch.from_numpy(batch),
-                                 dataset_index=torch.full((len(crops),), COCO_DATASET_INDEX, dtype=torch.long)
-                                 ).heatmaps.numpy()
+            heatmaps = self.pose(pixel_values=torch.from_numpy(batch).to(self.device),
+                                 dataset_index=torch.full((len(crops),), COCO_DATASET_INDEX, dtype=torch.long,
+                                                          device=self.device)).heatmaps.cpu().numpy()
         results = []
         for box, score, crop, heatmap in zip(boxes, scores, crops, heatmaps):
             if len(heatmap) != KEYPOINT_COUNT:

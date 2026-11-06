@@ -1,6 +1,9 @@
 """The weighing tab: starts by itself when opened and stops when left, to free the processor."""
 from datetime import datetime
+import json
+from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from threading import Thread
 import tkinter as tk
 from tkinter import ttk
@@ -9,10 +12,13 @@ import cv2
 import numpy as np
 
 from .body_measure import MIN_KEYPOINT_SCORE, MIN_SAMPLES, SKELETON
+from .gpu_pack import DOWNLOAD_SIZE_GB, gpu_pack_ready, install_gpu_pack, nvidia_present
 from .people_detection import DOWNLOAD_SIZE_MB, download_models, models_ready
-from .ui import note
+from .ui import Foldout, note
 
 OUTLINE_OPACITY = .35
+SHOWN_EXPERIMENTS = 30
+HISTORY_REFRESH_MS = 700
 PART_NAMES = (("torso", "туловище"), ("upper_arm", "плечо"), ("forearm", "предплечье"),
               ("thigh", "бедро"), ("shin", "голень"), ("head", "голова"))
 
@@ -58,6 +64,46 @@ def person_report(track_id, estimate) -> str:
     return "\n".join(lines)
 
 
+def saved_experiments(root, limit=SHOWN_EXPERIMENTS) -> list:
+    """Saved results, newest first, as (folder name, parsed result). Unreadable ones are skipped."""
+    results = []
+    for folder in sorted((Path(root) / "output").glob("weighing_*"), key=lambda path: path.name, reverse=True):
+        try:
+            data = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("people"), list):
+            results.append((folder.name, data))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def experiment_title(name, data) -> str:
+    """Short list line: when it was made, and the mass of each person."""
+    stamp = name.removeprefix("weighing_")
+    try:
+        when = datetime.strptime(stamp, "%Y%m%d_%H%M%S").strftime("%d.%m %H:%M:%S")
+    except ValueError:
+        when = stamp
+    masses = [f"{person['mass_kg']:.0f} кг" for person in data["people"] if person.get("mass_kg")]
+    return f"{when}  ·  " + (", ".join(masses) if masses else "без оценки")
+
+
+def experiment_report(data) -> str:
+    """The same report as for a live person, from a saved result."""
+    parts = []
+    for person in data["people"]:
+        side = person.get("side_observed")
+        estimate = SimpleNamespace(height_m=person.get("height_m"), mass_kg=person.get("mass_kg"),
+                                   mass_low_kg=person.get("mass_low_kg"), mass_high_kg=person.get("mass_high_kg"),
+                                   widths_m=person.get("widths_m") or {}, side_widths_m=person.get("side_widths_m") or {},
+                                   view_coverage=person.get("views") or {}, samples=person.get("samples", 0),
+                                   message="Бок измерен." if side else "Бок не измерен.")
+        parts.append(person_report(person.get("label", "?"), estimate))
+    return "\n\n".join(parts) or "В этом результате нет людей."
+
+
 class WeighingTab:
     def __init__(self, app, page, sidebar, view, footer, heading, action, panel_class):
         self.app, self.page = app, page
@@ -76,12 +122,59 @@ class WeighingTab:
         self.download_button = action(footer, f"Скачать модели ({DOWNLOAD_SIZE_MB} МБ)", self.start_download, primary=True)
         self.reset_button = action(footer, "Начать замеры заново", lambda: app.send("weighing_reset"), "calibrated")
         self.save_button = action(footer, "Сохранить результат", self.save, "calibrated")
+        self.gpu_button = action(footer, f"Ускорить на видеокарте ({DOWNLOAD_SIZE_GB} ГБ)", self.start_gpu_install)
+        self.build_history(sidebar)
         self.panel = panel_class(view, "Люди в кадре", empty="Здесь появятся найденные люди",
                                  hint="Подключите камеры и встаньте в кадр")
         self.panel.pack(fill="both", expand=True)
         self.available = models_ready(app.directory)
         app.workflow.bind("<<NotebookTabChanged>>", self.tab_changed, add="+")
         self.show_download_state()
+        if gpu_pack_ready(app.directory):
+            self.gpu_button.pack_forget()
+        else:
+            # Asking the driver takes a moment, and only matters if the button may be pressed.
+            Thread(target=lambda: self.downloads.put(("nvidia", nvidia_present())), daemon=True).start()
+
+    def build_history(self, parent) -> None:
+        self.history_items = []
+        history = Foldout(parent, "Сохранённые эксперименты")
+        history.pack(fill="x", pady=(10, 4))
+        self.history_list = tk.Listbox(history.content, height=7, exportselection=False, activestyle="none")
+        self.history_list.pack(fill="x")
+        self.history_list.bind("<<ListboxSelect>>", self.show_experiment)
+        self.history_text = tk.StringVar(value="Выберите эксперимент, чтобы увидеть его числа.")
+        ttk.Label(history.content, textvariable=self.history_text, wraplength=280, justify="left").pack(anchor="w", fill="x", pady=(6, 0))
+        self.refresh_history()
+
+    def refresh_history(self) -> None:
+        selected = self.history_list.curselection()
+        chosen = self.history_items[selected[0]][0] if selected else None
+        self.history_items = saved_experiments(self.app.directory)
+        self.history_list.delete(0, "end")
+        for index, (name, data) in enumerate(self.history_items):
+            self.history_list.insert("end", experiment_title(name, data))
+            if name == chosen:
+                self.history_list.selection_set(index)
+
+    def show_experiment(self, event=None) -> None:
+        selected = self.history_list.curselection()
+        if selected:
+            self.history_text.set(experiment_report(self.history_items[selected[0]][1]))
+
+    def start_gpu_install(self) -> None:
+        if self.downloading:
+            return
+        self.downloading = True
+        self.gpu_button.configure(state="disabled")
+
+        def work():
+            try:
+                install_gpu_pack(self.app.directory, lambda text: self.downloads.put(("status", text)))
+                self.downloads.put(("gpu_done", None))
+            except RuntimeError as error:
+                self.downloads.put(("error", str(error)))
+        Thread(target=work, daemon=True, name="gpu-download").start()
 
     def ready(self) -> bool:
         return self.available
@@ -98,6 +191,8 @@ class WeighingTab:
         return self.app.workflow.select() == str(self.page)
 
     def tab_changed(self, event=None) -> None:
+        if self.selected():
+            self.refresh_history()
         self.sync()
 
     def sync(self) -> None:
@@ -136,7 +231,15 @@ class WeighingTab:
                 kind, value = self.downloads.get_nowait()
                 if kind == "status":
                     self.message.set(value)
+                elif kind == "nvidia":
+                    if not value:
+                        self.gpu_button.pack_forget()
+                elif kind == "gpu_done":
+                    self.downloading = False
+                    self.gpu_button.pack_forget()
+                    self.message.set("Ускорение установлено. Перезапустите программу, чтобы оно заработало.")
                 else:
+                    self.gpu_button.configure(state="normal")
                     self.downloading = False
                     self.download_button.configure(state="normal")
                     self.message.set("Модели скачаны." if kind == "done" else value)
@@ -161,3 +264,4 @@ class WeighingTab:
     def save(self) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.app.send("weighing_save", self.app.directory / "output" / f"weighing_{stamp}" / "result.json")
+        self.app.root.after(HISTORY_REFRESH_MS, self.refresh_history)

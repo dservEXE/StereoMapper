@@ -29,9 +29,11 @@ MAX_GAP_PX = 2
 DEPTH_EROSION_PX = 9
 DEPTH_BIN_M = .04
 MIN_DEPTH_PIXELS = 30
-# Stereo distance to one person jumped by a metre between frames at 3 m, and every size scales
-# with it. A person turning on the spot stays put, so the recent median is far steadier.
-DEPTH_WINDOW = 15
+# Stereo distance to one person jumped by a metre between frames at 3 m while their height in
+# pixels moved by under 2%. Distance times pixel height is constant for one upright body, so a
+# single scale per person removes that noise, and the person may even walk.
+MIN_SCALE_SAMPLES = 5
+MAX_SCALE_CORRECTION = 1.6
 SAMPLES_ALONG_PART = 7
 # Part of a limb next to a joint is widened by the neighbouring part, so sample its middle.
 PART_START, PART_END = .25, .75
@@ -146,7 +148,9 @@ def body_slices(mask, neck, ankle, reach_px, scale) -> tuple:
             continue
         changes = np.flatnonzero(np.diff(np.concatenate(((0,), line.astype(np.int8), (0,)))))
         runs = changes[1::2] - changes[::2]
-        widths.append(float(runs[runs >= MIN_RUN_PX].sum()) * scale)
+        total = float(runs[runs >= MIN_RUN_PX].sum()) * scale
+        # A body has no empty level between shoulders and ankles: the outline missed this one.
+        widths.append(total if total > 0 else math.nan)
         split.append(int((runs >= MIN_RUN_PX).sum()) >= 2)
     return tuple(widths), tuple(split)
 
@@ -305,35 +309,52 @@ def percentile(values, q):
 class BodyAccumulator:
     """Combine one person's frames: front and side views need separating as they turn."""
     samples: list = field(default_factory=list)
-    recent_depths: list = field(default_factory=list)
 
     def add(self, sample: BodySample) -> None:
-        self.recent_depths = (self.recent_depths + [sample.depth])[-DEPTH_WINDOW:]
-        self.samples.append(rescaled(sample, float(np.median(self.recent_depths))))
+        self.samples.append(sample)
         if len(self.samples) > MAX_SAMPLES:
             del self.samples[0]
 
-    def views(self) -> list:
+    def steady(self) -> list:
+        """All frames at one scale for this body, as if depth had been free of noise."""
+        heights = [sample.height for sample in self.samples if sample.height]
+        depths = [sample.depth for sample in self.samples]
+        if len(heights) < MIN_SCALE_SAMPLES:
+            middle = float(np.median(depths)) if depths else 0.
+            return [rescaled(sample, middle) for sample in self.samples]
+        height = float(np.median(heights))
+        steady = []
+        for sample in self.samples:
+            if not sample.height:
+                continue
+            # This frame's outline can be cut short: then its pixels say nothing about scale.
+            correction = height / sample.height
+            if 1 / MAX_SCALE_CORRECTION <= correction <= MAX_SCALE_CORRECTION:
+                steady.append(rescaled(sample, sample.depth * correction))
+        return steady or list(self.samples)
+
+    def views(self, samples) -> list:
         """Apparent turn of each sample, from how narrow the shoulders look."""
-        widest = percentile([s.shoulder_span for s in self.samples], 95) or 1.
-        return [math.degrees(math.acos(min(1., s.shoulder_span / max(widest, 1e-6)))) for s in self.samples]
+        widest = percentile([s.shoulder_span for s in samples], 95) or 1.
+        return [math.degrees(math.acos(min(1., s.shoulder_span / max(widest, 1e-6)))) for s in samples]
 
     def part_values(self, part, selected) -> list:
         return [sample.widths[key] for sample in selected for key in (part, f"{part}_l", f"{part}_r")
                 if key in sample.widths]
 
-    def part_length(self, part) -> float | None:
+    def part_length(self, part, samples) -> float | None:
         # Foreshortening only ever shortens a part, so favour the longer views.
-        values = [sample.lengths[key] for sample in self.samples for key in (part, f"{part}_l", f"{part}_r")
+        values = [sample.lengths[key] for sample in samples for key in (part, f"{part}_l", f"{part}_r")
                   if key in sample.lengths]
         return percentile(values, 80)
 
     def estimate(self) -> WeightEstimate:
         count = len(self.samples)
-        views = self.views()
-        front = [s for s, view in zip(self.samples, views) if view <= FRONT_MAX_DEG]
-        side = [s for s, view in zip(self.samples, views) if view >= SIDE_MIN_DEG]
-        coverage = dict(front=len(front), oblique=count - len(front) - len(side), side=len(side))
+        samples = self.steady()
+        views = self.views(samples)
+        front = [s for s, view in zip(samples, views) if view <= FRONT_MAX_DEG]
+        side = [s for s, view in zip(samples, views) if view >= SIDE_MIN_DEG]
+        coverage = dict(front=len(front), oblique=len(samples) - len(front) - len(side), side=len(side))
         heights = [s.height for s in self.samples if s.height is not None]
         height = percentile(heights, 50) if len(heights) >= MIN_BIN_SAMPLES else None
         if count < MIN_SAMPLES:
@@ -342,9 +363,9 @@ class BodyAccumulator:
         widths, side_widths, lengths = {}, {}, {}
         for part in REPORTED_PARTS:
             front_values = self.part_values(part, front)
-            values = front_values if len(front_values) >= MIN_BIN_SAMPLES else self.part_values(part, self.samples)
+            values = front_values if len(front_values) >= MIN_BIN_SAMPLES else self.part_values(part, samples)
             width = percentile(values, 50)
-            length = self.part_length(part)
+            length = self.part_length(part, samples)
             if width is None or length is None:
                 continue
             widths[part], lengths[part] = width, length
@@ -352,13 +373,13 @@ class BodyAccumulator:
             if len(side_values) >= MIN_BIN_SAMPLES:
                 side_widths[part] = percentile(side_values, 50)
         front_slices = slice_profile(front) if len(front) >= MIN_BIN_SAMPLES else None
-        front_slices = front_slices if front_slices is not None else slice_profile(self.samples)
+        front_slices = front_slices if front_slices is not None else slice_profile(samples)
         if not {"torso", "head", "thigh", "shin"} <= set(widths) or front_slices is None:
             missing = "ноги" if not {"thigh", "shin"} <= set(widths) or front_slices is None else "туловище и голову"
             return WeightEstimate(count, height, widths, side_widths, lengths, None, None, None, None, False,
                                   coverage, f"Не видно: {missing}. Нужен человек в кадре целиком.")
-        lengths_seen = [sample.slice_length for sample in self.samples if sample.slice_length]
-        split_rows = [sample.slice_split for sample in (front or self.samples) if sample.slice_split]
+        lengths_seen = [sample.slice_length for sample in samples if sample.slice_length]
+        split_rows = [sample.slice_split for sample in (front or samples) if sample.slice_split]
         split = np.mean(np.array(split_rows, float), axis=0) >= .5
         side_slices = slice_profile(side) if len(side) >= MIN_BIN_SAMPLES else None
         observed_side = side_slices is not None
