@@ -21,6 +21,7 @@ from .ghost_filter import MultiViewConfirmation
 from .cloud_orientation import initial_camera_pose
 from .maixsense import MaixSensePump, TOF_MODE
 from .tof_engine import TofEngine, TOF_MAX_RANGE_M, tof_precision_snapshot
+from .experiment_files import experiment_setup
 from .weighing import WeighingSession
 
 STEREO_ONLY_COMMANDS = {"capture", "capture_after", "calibrate", "new_series", "load",
@@ -239,7 +240,7 @@ class CameraWorker(Thread):
         elif name == "weighing_save":
             if not self.weighing:
                 raise ValueError("Откройте вкладку взвешивания и дождитесь замеров.")
-            count = self.weighing.save(value)
+            count = self.weighing.save(value, experiment_setup(self.config, self.calibration))
             self.emit("status", f"Результат сохранён, людей: {count}. Файл: {value}")
         elif name == "signal_filter":
             self.signal_filter = bool(value)

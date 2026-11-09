@@ -1,6 +1,5 @@
 """Background person weighing: never slows capture or depth, always works on the newest frame."""
 from dataclasses import dataclass
-import json
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 import time
@@ -9,8 +8,8 @@ import numpy as np
 
 from .body_measure import (BodyAccumulator, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, measure_person, outline_depth,
                            outline_disparity)
+from .experiment_files import write_experiment
 from .people_tracking import PersonTracker
-from .version import VERSION
 
 
 DEFAULT_DISTANCE_M = 3.
@@ -228,13 +227,9 @@ class WeighingSession(Thread):
         with self.lock:
             return self.state
 
-    def save(self, path) -> int:
+    def save(self, path, setup=None) -> int:
         """Write numbers only: no images and nothing that identifies a person."""
         state = self.snapshot()
         people = [person_result(track_id, estimate) for track_id, estimate in sorted(state.known.items())
                   if estimate.samples]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(dict(units="metres, litres, kilograms", validated_against_scales=False,
-                                        app_version=VERSION, people=people), ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        return len(people)
+        return write_experiment(path, people, setup)

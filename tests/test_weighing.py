@@ -25,6 +25,7 @@ from stereo.body_measure import (BODY_DENSITY_KG_M3, BodyAccumulator, fill_holes
                                  outline_depth, outline_disparity, part_width, rescaled, slice_profile, slices_volume, span_width)
 from stereo.people_detection import (DETECTOR, DOWNLOAD_SIZE_MB, SEGMENTER, SOURCES, crop_matrix, decode_heatmaps, download_models,
                                      model_path, models_ready, outline_hints, peak, pose_crop)
+from stereo.experiment_files import experiment_setup
 from stereo.people_tracking import PersonTracker, box_iou
 from stereo.weighing import WeighingSession
 from stereo.worker import CameraWorker
@@ -715,6 +716,18 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn("image", json.dumps(data))
         self.assertEqual(len(data["people"][0]["slices_front_m"]), SLICES)
 
+    def test_saved_result_records_the_camera_and_calibration_quality(self):
+        session = self.run_session()
+        calibration = type("C", (), dict(rms=.42, epipolar_error=.3, baseline=.06, size=(640, 480)))()
+        setup = experiment_setup(type("Config", (), dict(mode="usb"))(), calibration)
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "result.json"
+            session.save(path, setup)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["setup"]["camera"], "usb")
+        self.assertEqual(data["setup"]["calibration"], dict(rms_px=.42, vertical_error_px=.3, baseline_m=.06,
+                                                            image_size_px=[640, 480]))
+
     def test_chance_detection_without_a_measurement_is_not_saved(self):
         session = self.run_session()
         with session.lock:
@@ -1091,6 +1104,45 @@ class TabTests(unittest.TestCase):
         self.fill_form()
         self.tab.add_to_database()
         self.assertEqual(self.tab.database.entries()[0].estimated_weight_kg, 71.4)
+
+    def test_real_data_is_written_into_the_saved_experiment_folder(self):
+        ExperimentHistoryTests().save(self.temp.name, "20261106_100000")
+        self.tab.refresh_history()
+        self.tab.history_list.selection_set(self.tab.history_list.get_children()[0])
+        self.tab.use_experiment()
+        self.fill_form(height="180", weight="70", label="B-02")
+        self.tab.add_to_database()
+        path = Path(self.temp.name) / "output" / "weighing_20261106_100000" / "result.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        real = data["people"][0]["real"]
+        self.assertEqual((real["label"], real["height_cm"], real["weight_kg"]), ("B-02", 180., 70.))
+        self.assertAlmostEqual(real["weight_error_kg"], 1.4)
+        self.assertAlmostEqual(real["height_error_cm"], 0.)
+        self.assertIs(data["validated_against_scales"], True)
+        self.assertEqual(data["people"][0]["mass_kg"], 71.4)
+        self.assertIn("Папка замера", self.tab.entry_feedback.get())
+
+    def test_live_measurement_with_real_data_gets_its_own_experiment_folder(self):
+        self.tab.shown = self.live_state()
+        self.tab.refresh_sources()
+        self.fill_form()
+        self.tab.add_to_database()
+        folders = list((Path(self.temp.name) / "output").glob("weighing_*"))
+        self.assertEqual(len(folders), 1)
+        data = json.loads((folders[0] / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["people"][0]["real"]["weight_kg"], 53.5)
+        self.assertIn("saved", data["setup"])
+        self.assertEqual(len(self.tab.history_items), 1)
+
+    def test_a_folder_that_cannot_be_written_is_reported_but_the_database_keeps_the_entry(self):
+        ExperimentHistoryTests().save(self.temp.name, "20261106_100000")
+        self.tab.refresh_history()
+        self.tab.refresh_sources()
+        self.fill_form()
+        with patch("stereo.weighing_ui.attach_real_data", side_effect=OSError("занято")):
+            self.tab.add_to_database()
+        self.assertIn("не записано: занято", self.tab.entry_feedback.get())
+        self.assertEqual(len(self.tab.database.entries()), 1)
 
     def test_deleting_asks_first_and_removes_only_after_a_yes(self):
         self.tab.shown = self.live_state()

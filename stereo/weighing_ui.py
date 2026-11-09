@@ -14,6 +14,7 @@ import numpy as np
 
 from .body_measure import MIN_KEYPOINT_SCORE, MIN_SAMPLES, SKELETON
 from .gpu_pack import PACKS, graphics_adapters, install_pack, installed_pack, pack_advice, pending_pack
+from .experiment_files import RESULT_FILE, attach_real_data, experiment_setup, write_experiment
 from .people_database import CLOTHING, PeopleDatabase, SEXES, export_csv, make_entry, summarize, summary_text
 from .people_detection import DOWNLOAD_SIZE_MB, download_models, models_ready
 from .ui import fit_wrap, note
@@ -255,19 +256,23 @@ class WeighingTab:
         self.refresh_database()
 
     def refresh_sources(self) -> None:
-        """Measurements that can be paired with real data: live people first, then saved ones."""
+        """Measurements that can be paired with real data: live people first, then saved ones.
+
+        Each is (numbers, experiment folder); a live person has no folder until the real data is added.
+        """
         sources = {}
         known = self.shown.known if self.shown is not None else {}
         for track_id, estimate in sorted(known.items()):
             if estimate.samples:
                 # No mass in this name: it changes while real data is being typed.
-                sources[f"Сейчас · №{track_id}"] = person_result(track_id, estimate)
+                sources[f"Сейчас · №{track_id}"] = (person_result(track_id, estimate), None)
         for name, data in self.history_items:
             when = experiment_title(name, dict(people=[])).split("  ")[0]
+            folder = self.app.directory / "output" / name
             for person in data["people"]:
                 if person.get("samples"):
                     mass = f"{person['mass_kg']:.0f} кг" if person.get("mass_kg") else "без оценки"
-                    sources[f"{when} · №{person.get('label', '?')} · {mass}"] = person
+                    sources[f"{when} · №{person.get('label', '?')} · {mass}"] = (person, folder)
         self.sources = sources
         self.source_box.configure(values=list(sources))
         if self.entry_source.get() not in sources:
@@ -282,8 +287,9 @@ class WeighingTab:
             return
         worker = self.app.worker
         camera = getattr(getattr(worker, "config", None), "mode", "")
+        measurement, folder = self.sources.get(self.entry_source.get(), (None, None))
         try:
-            entry = make_entry(self.sources.get(self.entry_source.get()), self.entry_label.get(), self.entry_height.get(),
+            entry = make_entry(measurement, self.entry_label.get(), self.entry_height.get(),
                                self.entry_weight.get(), self.entry_sex.get(), self.entry_clothing.get(),
                                self.entry_scales.get(), camera, VERSION)
             self.database.add(entry)
@@ -294,13 +300,35 @@ class WeighingTab:
             self.entry_feedback.set(f"Не удалось записать в базу: {error}")
             return
         estimate = entry.estimated_weight_kg
-        self.entry_feedback.set(f"Записано. Камера {estimate:.1f} кг, реально {entry.real_weight_kg:g} кг, "
-                                f"ошибка {entry.weight_error_kg:+.1f} кг." if estimate is not None else
-                                "Записано; в этом замере нет оценки веса.")
+        stored = self.store_in_experiment(folder, measurement.get("label"), entry)
+        self.entry_feedback.set((f"Записано. Камера {estimate:.1f} кг, реально {entry.real_weight_kg:g} кг, "
+                                 f"ошибка {entry.weight_error_kg:+.1f} кг." if estimate is not None else
+                                 "Записано; в этом замере нет оценки веса.") + " " + stored)
         self.entry_label.set("")
         self.entry_height.set("")
         self.entry_weight.set("")
         self.refresh_database()
+
+    def store_in_experiment(self, folder, person_label, entry) -> str:
+        """Put the real data into the measurement's own result.json; a live one is saved there first."""
+        try:
+            if folder is None:
+                folder = self.save_live_experiment()
+            attach_real_data(folder / RESULT_FILE, person_label, entry)
+        except (OSError, ValueError) as error:
+            return f"В папку замера не записано: {error}"
+        self.refresh_history()
+        return f"Папка замера: {folder}"
+
+    def save_live_experiment(self) -> Path:
+        """Everyone measured now, written by the interface so the real data can follow at once."""
+        known = self.shown.known if self.shown is not None else {}
+        people = [person_result(track_id, estimate) for track_id, estimate in sorted(known.items()) if estimate.samples]
+        worker = self.app.worker
+        folder = self.app.directory / "output" / f"weighing_{datetime.now():%Y%m%d_%H%M%S}"
+        write_experiment(folder / RESULT_FILE, people, experiment_setup(getattr(worker, "config", None),
+                                                                       getattr(worker, "calibration", None)))
+        return folder
 
     def refresh_database(self) -> None:
         try:
