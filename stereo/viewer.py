@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageTk
 from .cloud_document import CloudDocument, load_cloud
 from .cloud_geometry import cloud_bounds, project_points, render_points, selection_mask, box_mask, pick_point
+from .cloud_measure import point_distance, format_distance
 from .trackball import arcball_rotation, axis_rotation
 from .registration import rigid_transform, refine_icp
 from .cloud_orientation import (canonical_view, frame_from_plane, rotation_matrix,
@@ -17,6 +18,10 @@ from .ui import ScrolledFrame
 
 FILE_TYPES = [("Облако или проект", "*.ply *.sqlite *.cloudproj"), ("PLY", "*.ply"),
               ("Архив карты", "*.sqlite"), ("Проект 3D", "*.cloudproj")]
+
+
+# Ruler line and labels: cyan stands apart from yellow selection and landmarks.
+MEASURE_COLOR, MEASURE_LABEL_BG = "#4ff0ff", "#10181f"
 
 
 # Room one compass label needs, in pixels: wide enough for the longest name.
@@ -56,6 +61,7 @@ class CloudViewer:
         self.scene_frame = np.eye(3)
         self.bookmarks = {}
         self.plane_points = None
+        self.measure_points = []
         self.projection = tk.StringVar(value="perspective")
         self.view_name = tk.StringVar(value="Мой вид")
         self.rotation = np.eye(3)
@@ -250,6 +256,37 @@ class CloudViewer:
         else:self.message.set(f"Горизонт {len(self.plane_points)+1}/3: щёлкните следующую точку той же горизонтальной плоскости.")
         self.request_draw()
 
+    def pick_measure(self,x,y):
+        points=self.points[self.displayed()]; w,h=self.viewport()
+        index=pick_point(points,x,y,w,h,**self.camera(),radius=12,point_size=self.point_size.get())
+        if index is None:self.message.set("Рядом нет видимой точки. Щёлкните ближе к облаку или увеличьте деталь."); return
+        if len(self.measure_points)>=2:self.measure_points=[]
+        self.measure_points.append(points[index].copy())
+        if len(self.measure_points)==1:self.message.set("Точка A выбрана. Щёлкните точку B.")
+        else:self.message.set(f"Расстояние A–B по прямой: {self.measure_text()}. Щелчок начинает новый замер, Esc — сброс.")
+        self.request_draw()
+
+    def measure_text(self):
+        return format_distance(point_distance(*self.measure_points[:2]),self.units)
+
+    def clear_measure(self):
+        self.measure_points=[]; self.message.set("Замер сброшен. Щёлкните точку A."); self.request_draw()
+
+    def draw_measure(self,w,h):
+        if not self.measure_points:return
+        xy,_,front=project_points(np.asarray(self.measure_points),w,h,**self.camera())
+        ends=[(float(x),float(y)) for (x,y),visible in zip(xy,front) if visible]
+        if len(ends)==2:self.canvas.create_line(*ends[0],*ends[1],fill=MEASURE_COLOR,width=2)
+        for (x,y),visible,name in zip(xy,front,"AB"):
+            if visible:
+                self.canvas.create_oval(x-5,y-5,x+5,y+5,outline=MEASURE_COLOR,width=2)
+                self.canvas.create_text(x+10,y-10,text=name,fill=MEASURE_COLOR,anchor="sw")
+        if len(self.measure_points)==2:
+            x,y=np.mean(ends,axis=0) if len(ends)==2 else (w/2,24)
+            label=self.canvas.create_text(x,y-12,text=self.measure_text(),fill=MEASURE_COLOR,font=(ui.FONT,11,"bold"))
+            box=self.canvas.create_rectangle(*np.add(self.canvas.bbox(label),(-6,-3,6,3)),fill=MEASURE_LABEL_BG,outline=MEASURE_COLOR)
+            self.canvas.tag_lower(box,label)
+
     def run_job(self,text,function,callback):
         if self.busy:return
         self.busy=True; self.message.set(text); self.sync_controls()
@@ -366,6 +403,8 @@ class CloudViewer:
         for var,index in ((self.active_layer,len(self.layer_names)-1),(self.reference_layer,0),(self.moving_layer,len(self.layer_names)-1)):
             if var.get() not in self.layer_names:var.set(self.layer_names[index] if self.layer_names else "")
         if self.view_layer is not None and self.view_layer>=len(self.layer_names):self.view_layer=None
+        # Edits and alignment can move or remove the measured points.
+        self.measure_points=[]
         if fit:self.fit()
         self.sync_controls(); self.tool_changed(); self.request_draw()
 
@@ -425,8 +464,13 @@ class CloudViewer:
             self.merge_text.set("Выбор меток остановлен. Для сшивки снова нажмите «Указать 3 пары точек».")
         if self.tool.get()!="rotate" and self.plane_points is not None:
             self.plane_points=None; self.message.set("Настройка горизонта остановлена при смене инструмента.")
+        measuring=self.tool.get()=="measure"
+        if not measuring:self.measure_points=[]
+        if measuring:self.measure_button.pack(side="left",padx=3,pady=2,after=self.measure_radio)
+        else:self.measure_button.pack_forget()
         text={"rotate":"ЛКМ — вращать: центр наклоняет, края поворачивают вокруг взгляда",
-              "rectangle":"ЛКМ — протянуть прямоугольник","lasso":"ЛКМ — обвести область лассо","brush":"Кисть: ЛКМ сразу добавляет точки · Ctrl — вычитать · Esc — снять выделение"}[self.tool.get()]
+              "rectangle":"ЛКМ — протянуть прямоугольник","lasso":"ЛКМ — обвести область лассо","brush":"Кисть: ЛКМ сразу добавляет точки · Ctrl — вычитать · Esc — снять выделение",
+              "measure":"Линейка: щёлкните точку A, затем B · следующий щелчок начинает новый замер · перетаскивание вращает · Esc — сбросить замер"}[self.tool.get()]
         self.help_text.set(text+" · Alt+ЛКМ — вращать · ПКМ/СКМ — сдвиг · колесо — масштаб")
         self.canvas.configure(cursor="fleur" if self.tool.get()=="rotate" else "crosshair")
         self.request_draw()
@@ -434,10 +478,13 @@ class CloudViewer:
     def start_drag(self,event,mode):
         if self.busy:return
         self.canvas.focus_set()
+        measure=False
         if mode=="left":
             mode=self.tool.get()
+            # The ruler rotates on drag and picks a point on a short click.
+            if mode=="measure":mode,measure="rotate",True
         if mode=="rotate" and event.state&1:mode="roll"
-        self.drag=dict(start=(event.x,event.y),last=(event.x,event.y),mode=mode,state=event.state,distance=0.)
+        self.drag=dict(start=(event.x,event.y),last=(event.x,event.y),mode=mode,state=event.state,distance=0.,measure=measure)
         self.stroke=[(event.x,event.y)]
         if mode=="brush":
             if not self.require_complete():self.drag=None; return
@@ -464,6 +511,7 @@ class CloudViewer:
         if self.busy:return
         if self.plane_points is not None and drag["mode"] in ("rotate","roll") and drag["distance"]<4:self.pick_plane(event.x,event.y)
         elif self.landmark_task and drag["mode"] in ("rotate","roll") and drag["distance"]<4:self.pick_landmark(event.x,event.y)
+        elif drag["measure"] and drag["distance"]<4:self.pick_measure(event.x,event.y)
         elif drag["mode"] in ("rectangle","lasso") and self.require_complete():
             try:
                 w,h=self.viewport(); kwargs=self.camera()
@@ -684,6 +732,7 @@ class CloudViewer:
         if self.plane_points is not None:
             self.plane_points=None; self.message.set("Настройка горизонта отменена.")
         elif self.landmark_task:self.cancel_landmarks()
+        elif self.measure_points:self.clear_measure()
         else:self.clear_selection()
         self.request_draw()
 
@@ -734,6 +783,7 @@ class CloudViewer:
             self.canvas.create_oval(w/2-radius,h/2-radius,w/2+radius,h/2+radius,outline=ui.palette().image_line,dash=(4,6))
         if self.drag and self.drag["mode"]=="rectangle":self.canvas.create_rectangle(*self.drag["start"],*self.drag["last"],outline="#ffda45",width=2,dash=(5,3))
         elif self.drag and self.drag["mode"]=="lasso" and len(self.stroke)>1:self.canvas.create_line(*np.asarray(self.stroke).ravel().tolist(),fill="#ffda45",width=2)
+        self.draw_measure(w,h)
         self.draw_brush_cursor()
         label={"metres":"метры","millimetres":"миллиметры","relative":"условный масштаб","unknown":"масштаб не указан"}.get(self.units,self.units)
         self.caption.configure(text=f"{self.document.count:,} точек · {label}")

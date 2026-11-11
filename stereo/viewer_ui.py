@@ -29,8 +29,11 @@ def build(v):
     v.project_button.configure(style="Accent.TButton"); v.project_button.pack_configure(side="right")
     v.export_button=v.button(files,"Экспорт PLY…",v.save_ply); v.export_button.pack_configure(side="right")
     tools=ttk.Frame(v.window,padding=(ui.SPACE_L,ui.SPACE_S,ui.SPACE_M,0)); tools.pack(fill="x")
-    for text,name in (("Вращать","rotate"),("Прямоугольник","rectangle"),("Лассо","lasso"),("Кисть","brush")):
-        ttk.Radiobutton(tools,text=text,variable=v.tool,value=name,command=v.tool_changed).pack(side="left",padx=(0,ui.SPACE_M))
+    for text,name in (("Вращать","rotate"),("Прямоугольник","rectangle"),("Лассо","lasso"),("Кисть","brush"),("Линейка","measure")):
+        v.measure_radio=ttk.Radiobutton(tools,text=text,variable=v.tool,value=name,command=v.tool_changed)
+        v.measure_radio.pack(side="left",padx=(0,ui.SPACE_M))
+    # Shown only while the ruler is chosen; tool_changed places it after the ruler.
+    v.measure_button=v.button(tools,"Сбросить замер",v.clear_measure); v.measure_button.pack_forget()
     v.button(tools,"Вписать",v.fit)
     for text,name in (("Спереди","front"),("Сверху","top"),("Справа","right")):
         v.button(tools,text,lambda n=name:v.preset(n))

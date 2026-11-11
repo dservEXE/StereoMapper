@@ -184,6 +184,44 @@ class CloudViewerTests(unittest.TestCase):
         viewer.canvas.event_generate('<ButtonRelease-1>',x=290,y=280,state=0x20100)
         self.assertFalse(np.allclose(viewer.rotation,before))
 
+    def click(self, viewer, xy):
+        event=self.event(*xy); viewer.start_drag(event,'left'); viewer.release(event)
+
+    def test_ruler_picks_nearest_point_under_cursor(self):
+        points=np.array([[-.3,0.,0.],[.3,.4,0.],[-.25,0.,0.]])
+        viewer=self.viewer(points); viewer.tool.set('measure'); viewer.tool_changed()
+        xy=self.screen_points(viewer); step=(xy[2]-xy[0])/np.linalg.norm(xy[2]-xy[0])
+        self.assertGreater(np.linalg.norm(xy[2]-xy[0]),10)
+        self.click(viewer,xy[0]+3*step)
+        self.click(viewer,xy[2]-3*step)
+        np.testing.assert_array_equal(viewer.measure_points,points[[0,2]])
+        viewer.cancel(); self.assertEqual(viewer.measure_points,[])
+        self.click(viewer,(5,5))
+        self.assertEqual(viewer.measure_points,[]); self.assertIn("нет видимой точки",viewer.message.get())
+
+    def test_ruler_draws_line_with_distance_and_restarts_or_resets(self):
+        points=np.array([[-.3,0.,0.],[.3,.4,0.],[0.,-.4,.1]])
+        for scale,units in ((1,'metres'),(1000,'millimetres')):
+            viewer=self.viewer(points*scale,units=units); viewer.tool.set('measure'); viewer.tool_changed()
+            viewer.document.select(np.ones(3,bool))
+            xy=self.screen_points(viewer)
+            self.click(viewer,xy[0]); self.assertIn("Точка A",viewer.message.get())
+            self.click(viewer,xy[1])
+            self.assertIn("721.1 мм",viewer.message.get())
+            viewer.draw()
+            texts=[viewer.canvas.itemcget(item,'text') for item in viewer.canvas.find_all() if viewer.canvas.type(item)=='text']
+            self.assertIn("721.1 мм",texts)
+            self.assertTrue(any(viewer.canvas.type(item)=='line' and viewer.canvas.itemcget(item,'fill')=="#4ff0ff" for item in viewer.canvas.find_all()))
+            rotation=viewer.rotation.copy()
+            self.drag(viewer,[xy[2],xy[2]+(40,10),xy[2]+(80,20)])
+            self.assertEqual(len(viewer.measure_points),2); self.assertFalse(np.allclose(viewer.rotation,rotation))
+            xy=self.screen_points(viewer)
+            self.click(viewer,xy[2]); self.assertEqual(len(viewer.measure_points),1)
+            viewer.cancel()
+            self.assertEqual(viewer.measure_points,[]); self.assertEqual(viewer.document.selection_count,3)
+            self.click(viewer,xy[2]); viewer.tool.set('rotate'); viewer.tool_changed()
+            self.assertEqual(viewer.measure_points,[]); self.assertFalse(viewer.measure_button.winfo_manager())
+
     def test_selecting_a_drawing_tool_exits_landmark_picking(self):
         viewer=self.viewer()
         viewer.document.add_cloud(self.points+.1,self.colors,'metres')
