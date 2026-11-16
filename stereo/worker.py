@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -24,8 +25,14 @@ from .tof_engine import TofEngine, TOF_MAX_RANGE_M, tof_precision_snapshot
 from .experiment_files import experiment_setup
 from .weighing import WeighingSession
 
+SUSPENDED_PAUSE_S = .2
 STEREO_ONLY_COMMANDS = {"capture", "capture_after", "calibrate", "new_series", "load",
-                        "restore_series", "board_settings"}
+                        "restore_series", "board_settings", "switch_resolution"}
+
+
+def size_mismatch_message(wanted, current):
+    return (f"Калибровка снята при {wanted[0]} × {wanted[1]}, а камера передаёт "
+            f"{current[0]} × {current[1]}. Выберите разрешение калибровки или снимите новую.")
 
 
 def stamp():
@@ -42,6 +49,7 @@ class CameraWorker(Thread):
         self.is_tof = config.mode == TOF_MODE
         self.signal_filter = signal_filter
         self.weighing_stopping = None
+        self.suspended = False
         self.weighing = None
         if self.is_tof:
             max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
@@ -118,8 +126,13 @@ class CameraWorker(Thread):
         if calibration.signature != self.config.signature():
             raise ValueError("Калибровка другого подключения или порядка камер. "
                              "Выберите прежние индексы и порядок либо снимите новую серию.")
-        if self.raw and calibration.size != (self.raw[0].shape[1], self.raw[0].shape[0]):
-            raise ValueError("Размер кадров отличается от калибровки. Верните исходное разрешение.")
+        current, wanted = self.calibration_size(), tuple(int(value) for value in calibration.size)
+        if current and wanted != current:
+            if self.capture_pump is None or self.is_tof:
+                raise ValueError(size_mismatch_message(wanted, current))
+            # Reopening the cameras interrupts the picture: the window asks the user first.
+            self.emit("resolution_mismatch", {"calibration": calibration, "wanted": wanted, "current": current})
+            return False
         engine = DepthEngine(calibration, self.max_depth, self.disparities, self.quality,
                              self.processing_width, self.temporal, self.near_priority, self.wide_view,
                              estimate_surfaces=self.estimate_surfaces,near_minimum=self.near_minimum,
@@ -131,6 +144,61 @@ class CameraWorker(Thread):
         self.frame = None
         self.reset_map()
         self.emit("calibration", calibration)
+        return True
+
+    def open_capture(self, config, retry_startup=True):
+        """Start the capture pump and wait for its first frames; return them, or None when stopped."""
+        if self.is_tof:
+            pump = MaixSensePump(config, lambda message: self.emit("status", message))
+        else:
+            pump = CapturePump(config, lambda message: self.emit("status", message), retry_startup=retry_startup)
+        pump.previews = self.previews
+        self.capture_pump = pump
+        pump.start()
+        try:
+            first = pump.take(self.stop_event)
+        except Exception:
+            self.close_capture()
+            raise
+        if first is None:
+            return None
+        self.config = config
+        self.raw = first[0]
+        self.capture_info = pump.info
+        self.last_capture_generation = pump.stream_generation
+        self.processed_frames = 0
+        return first
+
+    def close_capture(self):
+        pump, self.capture_pump = self.capture_pump, None
+        if pump is not None:
+            pump.stop_event.set()
+            pump.join(timeout=5)
+
+    def switch_resolution(self, calibration):
+        """Reopen the cameras at the size the calibration was taken at; on failure, go back."""
+        wanted, previous = tuple(int(value) for value in calibration.size), self.config
+        current = self.calibration_size()
+        if wanted == current:
+            return self.apply_calibration(calibration)
+        if self.mapping:
+            self.mapping = False
+            self.emit("mapping", False)
+        self.emit("status", f"Переключаю камеры на {wanted[0]} × {wanted[1]} — размер калибровки…")
+        self.close_capture()
+        try:
+            first = self.open_capture(replace(previous, width=wanted[0], height=wanted[1]), retry_startup=False)
+        except Exception as error:
+            self.emit("status", f"Камера не выдала {wanted[0]} × {wanted[1]}. Возвращаю {current[0]} × {current[1]}…")
+            self.open_capture(previous)
+            raise ValueError(size_mismatch_message(wanted, self.calibration_size()) +
+                             f" Камера не выдаёт нужный размер: {error}") from error
+        if first is None:
+            return False
+        if self.collector and self.collector.size not in (None, wanted):
+            self.new_series()
+        self.emit("resolution", wanted)
+        return self.apply_calibration(calibration)
 
     def reset_map(self):
         if self.map_integrator:
@@ -209,9 +277,9 @@ class CameraWorker(Thread):
             if name == "board_settings":
                 return
             raise ValueError("MaixSense измеряет глубину сама: стереокалибровка и съёмка доски ей не нужны.")
-        if self.calibration_busy and name in ('calibrate','capture','new_series','board_settings','load','restore_series','precision','scan_start'):
+        if self.calibration_busy and name in ('calibrate','capture','new_series','board_settings','load','switch_resolution','restore_series','precision','scan_start'):
             raise ValueError("Расчёт калибровки ещё идёт; дождитесь результата. Видео продолжает работать.")
-        if self.scan and name not in ('scan_stop','scan_extend','distance_report','weighing','weighing_reset','weighing_save'):
+        if self.scan and name not in ('scan_stop','scan_extend','distance_report','weighing','weighing_reset','weighing_save','suspend'):
             raise ValueError("Идёт объёмный снимок. Завершите его в окне накопления перед этой операцией.")
         if name == "depth":
             if value and self.engine is None:
@@ -233,6 +301,9 @@ class CameraWorker(Thread):
                 self.start_weighing()
             else:
                 self.stop_weighing()
+        elif name == "suspend":
+            # Another tab works alone: the cameras stay connected, nothing is computed.
+            self.suspended = bool(value)
         elif name == "weighing_reset":
             if self.weighing:
                 self.weighing.reset()
@@ -370,8 +441,12 @@ class CameraWorker(Thread):
                 self.emit("status","Накопление продолжится до нажатия «Завершить и сохранить».")
         elif name == "scan_stop":
             self.finish_scan()
-        elif name == "load":
-            self.apply_calibration(Calibration.load(value))
+        elif name in ("load", "switch_resolution"):
+            calibration = Calibration.load(value) if name == "load" else value
+            applied = (self.apply_calibration(calibration) if name == "load"
+                       else self.switch_resolution(calibration))
+            if not applied:
+                return
             self.depth_enabled = True
             self.emit("depth_enabled", True)
             self.emit("status", "Калибровка загружена; прежняя карта сброшена.")
@@ -527,17 +602,11 @@ class CameraWorker(Thread):
         try:
             self.map_renderer = MapPreview()
             self.map_renderer.start()
-            source = MaixSensePump if self.is_tof else CapturePump
-            camera = source(self.config, lambda message: self.emit("status", message))
-            camera.previews = self.previews
-            self.capture_pump = camera
-            camera.start()
-            first = camera.take(self.stop_event)
+            first = self.open_capture(self.config)
             if first is None:
                 return
-            self.raw, captured_at, sequence = first
-            self.capture_info = camera.info
-            self.last_capture_generation = camera.stream_generation
+            camera = self.capture_pump
+            _, captured_at, sequence = first
             log = self.root / "data" / "logs" / f"capture_{stamp()}.json"
             log.parent.mkdir(parents=True, exist_ok=True)
             log.write_text(json.dumps(self.capture_info, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -594,6 +663,12 @@ class CameraWorker(Thread):
                             self.emit("error", str(error))
                 except Empty:
                     pass
+                if self.capture_pump is not camera:
+                    # The cameras were reopened at another resolution.
+                    if self.capture_pump is None:
+                        break
+                    camera = self.capture_pump
+                    captured_at, sequence = time.perf_counter(), 0
                 if self.pending_capture is not None and captured_at >= self.pending_capture:
                     self.pending_capture = None
                     self.emit("capture_taken", None)
@@ -601,6 +676,9 @@ class CameraWorker(Thread):
                         self.command("capture")
                     except Exception as error:
                         self.emit("error", str(error))
+                if self.suspended and not self.scan:
+                    time.sleep(SUSPENDED_PAUSE_S)
+                    continue
                 tracking = "Накопление выключено"
                 depth_ms = 0
                 tracking_ms = insert_ms = 0.
@@ -708,9 +786,7 @@ class CameraWorker(Thread):
             if self.map_renderer:
                 self.map_renderer.stop_event.set()
                 self.map_renderer.join(timeout=2)
-            if camera:
-                camera.stop_event.set()
-                camera.join(timeout=5)
+            self.close_capture()
             self.close_maps()
             if self.engine:
                 self.engine.close()

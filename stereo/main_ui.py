@@ -172,6 +172,10 @@ def build(app):
     from .weighing_ui import WeighingTab
     app.weighing_tab=WeighingTab(app,app.workflow_pages["weighing"],weighing,views,app.ui_footers["weighing"],heading,action,ImagePanel)
 
+    pigs,views=page("pigs","5  Свиньи")
+    from .pig_ui import PigTab
+    app.pig_tab=PigTab(app,app.workflow_pages["pigs"],pigs,views,app.ui_footers["pigs"],heading,section,action,ImagePanel)
+
     advanced=ttk.Frame(app.workflow,style="App.TFrame",padding=PAGE_PADDING); app.workflow.add(advanced,text="Дополнительно")
     app.workflow_pages["advanced"]=advanced
     tools=ScrolledFrame(advanced,style="Card.TFrame",width=SIDEBAR_WIDTH,padding=ui.CARD_INSET); tools.pack(side="left",fill="y",padx=(0,PAGE_PADDING)); tools.pack_propagate(False)

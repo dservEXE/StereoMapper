@@ -195,7 +195,8 @@ def _capture_process(config, buffer, lock, sequence, timestamp, notices, stop):
 
 class CapturePump(Thread):
     """Supervise an isolated USB reader; keep fresh, bounded consumer queues."""
-    def __init__(self, config, status=None, *, process_target=None, stall_timeout=3., startup_timeout=20.):
+    def __init__(self, config, status=None, *, process_target=None, stall_timeout=3., startup_timeout=20.,
+                 retry_startup=True):
         super().__init__(daemon=True)
         self.config, self.status = config, status
         self.frames, self.previews = Queue(maxsize=1), Queue(maxsize=1)
@@ -205,6 +206,8 @@ class CapturePump(Thread):
         self.stream_generation = 0
         self.state = "starting"
         self.stall_timeout, self.startup_timeout = stall_timeout, startup_timeout
+        # Without retries a mode the driver refuses fails at once instead of falling back.
+        self.retry_startup = retry_startup
         self.process_target = process_target or _capture_process
         self.child = None
         self.ipc = None
@@ -318,6 +321,8 @@ class CapturePump(Thread):
                 self.dispose()
                 if self.stop_event.is_set():
                     break
+                if not self.retry_startup and not self.stream_generation:
+                    raise RuntimeError(reason)
                 now = time.perf_counter()
                 restarts.append(now)
                 failure_streak += 1
@@ -360,5 +365,5 @@ class CapturePump(Thread):
                 return self.frames.get(timeout=.2)
             except Empty:
                 if not self.is_alive():
-                    raise RuntimeError("Захват камер остановлен.")
+                    raise self.error or RuntimeError("Захват камер остановлен.")
         return None

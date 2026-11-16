@@ -448,6 +448,17 @@ class StereoApp:
         if path:
             self.send("load", path)
 
+    def ask_resolution_switch(self, value):
+        (width, height), (current_width, current_height) = value["wanted"], value["current"]
+        question = (f"Калибровка снята при {width} × {height}, а камера сейчас передаёт "
+                    f"{current_width} × {current_height}.\n\nПереключить камеры на {width} × {height}? "
+                    "Видео прервётся на несколько секунд. Поля разрешения в настройках не изменятся.")
+        if messagebox.askyesno("Разрешение калибровки", question, parent=self.root):
+            self.send("switch_resolution", value["calibration"])
+        else:
+            self.status.set(f"Калибровка не применена: она снята при {width} × {height}, "
+                            f"а камера передаёт {current_width} × {current_height}.")
+
     def is_calibration_window(self, window):
         if self.closing:
             return False
@@ -627,6 +638,10 @@ class StereoApp:
                             text='Калибровка рассчитывается…' if value else 'Рассчитать калибровку')
                     elif kind in ('scan_started','scan_progress','scan_finished'):
                         if self.scan_window:self.scan_window.update(kind,value)
+                    elif kind == "resolution_mismatch":
+                        self.ask_resolution_switch(value)
+                    elif kind == "resolution":
+                        self.stats.set(f"Реальный размер одного кадра: {value[0]} × {value[1]} — как у калибровки")
                     elif kind == "connected":
                         self.connection_pending=False
                         self.connected = True
@@ -766,6 +781,7 @@ class StereoApp:
                 pass
             self.show_preview()
         self.weighing_tab.poll(self.packet)
+        self.pig_tab.poll()
         if self.closing:
             if not self.worker or not self.worker.is_alive():
                 self.root.destroy()
@@ -810,6 +826,8 @@ class StereoApp:
         self.closing = True
         if hasattr(self, "updates"):
             self.updates.close()
+        if hasattr(self, "pig_tab"):
+            self.pig_tab.close()
         if self.worker:
             self.worker.stop_event.set()
         self.status.set("Освобождаю камеры и закрываю приложение…")
@@ -819,6 +837,8 @@ class StereoApp:
             self.closing=True
             if hasattr(self, "updates"):
                 self.updates.close()
+            if hasattr(self, "pig_tab"):
+                self.pig_tab.close()
             if self.poll_id:
                 try:self.root.after_cancel(self.poll_id)
                 except tk.TclError:pass

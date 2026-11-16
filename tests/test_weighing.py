@@ -1019,7 +1019,7 @@ class TabTests(unittest.TestCase):
     def test_leaving_the_tab_really_reaches_the_weighing_tab(self):
         # A later bind without add="+" once replaced this handler, and weighing kept running.
         script = self.app.workflow.bind("<<NotebookTabChanged>>")
-        self.assertEqual(script.count("if {"), 2, script)
+        self.assertEqual(script.count("if {"), 3, script)
         self.tab.available = True
         self.connect()
         self.open_tab()

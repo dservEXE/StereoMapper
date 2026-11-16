@@ -63,8 +63,8 @@ def model_path(root, source) -> Path:
     return Path(root) / "models" / source.folder
 
 
-def models_ready(root) -> bool:
-    for source in SOURCES:
+def models_ready(root, sources=None) -> bool:
+    for source in sources or SOURCES:
         directory = model_path(root, source)
         if not all((directory / name).is_file() for name in SETTINGS_FILES):
             return False
@@ -92,8 +92,8 @@ def fetch(url, target, opener=urllib.request.urlopen) -> str:
     return digest.hexdigest()
 
 
-def download_models(root, status=lambda message: None, opener=urllib.request.urlopen) -> None:
-    for source in SOURCES:
+def download_models(root, status=lambda message: None, opener=urllib.request.urlopen, sources=None) -> None:
+    for source in sources or SOURCES:
         directory = model_path(root, source)
         directory.mkdir(parents=True, exist_ok=True)
         for name in (*SETTINGS_FILES, WEIGHTS_FILE):
