@@ -115,7 +115,8 @@ def build(app):
 
     calibration,views=page("calibration","2  Калибровка")
     heading(calibration,"Свяжем пиксели с метрами","Калибровку выполняют один раз для пары камер и разрешения. Готовый файл можно загрузить.")
-    action(calibration,"Загрузить калибровку…",app.load_calibration,"connected")
+    action(calibration,"Загрузить последнюю калибровку",app.load_latest_calibration,"connected")
+    action(calibration,"Выбрать файл калибровки…",app.load_calibration,"connected")
     line(calibration)
     section(calibration,"Или снимите доску",0)
     note(calibration,"Сделайте 20–30 снимков: меняйте положение и наклон доски. Перед снимком замирайте.")

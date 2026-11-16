@@ -17,6 +17,8 @@ from .worker import CameraWorker
 from .maixsense import TOF_LABEL, TOF_MODE, normalize_address
 from .viewer import CloudViewer
 from .board import BoardSpec, BoardWindow
+from datetime import datetime
+from .calibration import latest_calibration
 from .calibration_ui import CalibrationShortcuts
 from .help_ui import help_icon, HELP
 from .presets import PRESETS
@@ -441,6 +443,15 @@ class StereoApp:
     def open_calibration_help(self):
         from .calibration_help import CalibrationHelpWindow
         CalibrationHelpWindow(self.root,self.directory)
+
+    def load_latest_calibration(self):
+        path = latest_calibration(self.directory)
+        if path is None:
+            self.status.set("Сохранённой калибровки пока нет. Снимите доску или выберите файл калибровки.")
+            return
+        when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+        self.status.set(f"Загружаю последнюю калибровку от {when}…")
+        self.send("load", str(path))
 
     def load_calibration(self):
         path = filedialog.askopenfilename(title="Калибровка этой стереопары", filetypes=[("Калибровка", "*.npz")],

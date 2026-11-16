@@ -1,7 +1,8 @@
-"""Find pigs in a picture and trace their outlines, with models downloaded on request.
+"""Find pigs in a picture, trace their outlines and estimate the distance to every pixel.
 
 D-FINE trained on Objects365 knows pigs, which the people detector does not. SlimSAM, shared with
-the people tab, traces every found animal from one pass over the picture.
+the people tab, traces every found animal from one pass over the picture. Depth Anything gives
+metres from the camera for every pixel of an ordinary photograph. All are downloaded on request.
 """
 import os
 from types import SimpleNamespace
@@ -16,15 +17,23 @@ from .people_detection import WEIGHTS_FILE, ModelSource, SEGMENTER, model_path
 DETECTOR = ModelSource("dfine-medium-obj365", "ustc-community/dfine-medium-obj365",
                        "f0fa3695138f3886d0da3f8dd17697e2ee8fc00f",
                        80462640, "0612b5b23f1438eae4d0eaeca07e0efef0b9e44cb23f14610eb7a563144094e8")
-SOURCES = (DETECTOR, SEGMENTER)
+DEPTH = ModelSource("depth-anything-v2-metric-indoor-small", "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+                    "8078d68a9c75a972131914f6afd0c1723be0da7f",
+                    99173660, "e990eb82fbf11b05b7813261196a2b841bdcf5a05f64396724a8987fa90504a3")
+SOURCES = (DETECTOR, SEGMENTER, DEPTH)
 PIG_LABEL = "Pig"
 # Seen from above, a pig is often taken for another four-legged animal. On this tab they are all pigs.
 LOOKALIKE_LABELS = ("Sheep", "Cow", "Dog", "Bear", "Horse", "Donkey", "Yak", "Elephant", "Antelope", "Deer", "Cat")
-PIG_THRESHOLD = .3
-LOOKALIKE_THRESHOLD = .45
+PIG_THRESHOLD = .4
+LOOKALIKE_THRESHOLD = .5
 MAX_OVERLAP = .6
 MIN_BOX_PX = 24
 MAX_ANIMALS = 40
+# An outline lying this much inside another is the same animal found twice, or a part of it.
+SAME_ANIMAL_SHARE = .6
+# An outline that holds two or more others of at least this share of its size has swallowed several animals.
+MERGED_PART_SHARE = .2
+MIN_OWN_SHARE = .5
 
 
 def missing_size_mb(root) -> int:
@@ -51,11 +60,41 @@ def keep_distinct(boxes, scores, limit=MAX_OVERLAP) -> list:
     return kept
 
 
+def distinct_outlines(masks, scores) -> list:
+    """(index, outline) for every real animal, so that none is counted twice.
+
+    A box around a head or a leg gives an outline inside the outline of the whole animal; a box
+    around two animals gives one outline over both. Both kinds are dropped, and every remaining
+    pixel is given to one animal only.
+    """
+    areas = [int(mask.sum()) for mask in masks]
+    live = [index for index, area in enumerate(areas) if area]
+
+    def inside(inner, outer) -> bool:
+        return (masks[inner] & masks[outer]).sum() > SAME_ANIMAL_SHARE * areas[inner]
+    merged = {outer for outer in live
+              if sum(inner != outer and MERGED_PART_SHARE * areas[outer] <= areas[inner] < areas[outer] and inside(inner, outer)
+                     for inner in live) >= 2}
+    kept = []
+    for index in sorted((index for index in live if index not in merged), key=lambda index: -areas[index]):
+        if not any(inside(index, other) for other in kept):
+            kept.append(index)
+    taken = np.zeros(masks[0].shape, bool) if masks else None
+    result = []
+    for index in sorted(kept, key=lambda index: -scores[index]):
+        own = masks[index] & ~taken
+        if own.sum() >= MIN_OWN_SHARE * areas[index]:
+            taken |= own
+            result.append((index, own))
+    return sorted(result, key=lambda item: item[0])
+
+
 class PigDetector:
     def __init__(self, root, status=lambda message: None):
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         import torch
-        from transformers import DFineForObjectDetection, RTDetrImageProcessor, SamImageProcessor, SamModel, SamProcessor
+        from transformers import (AutoImageProcessor, AutoModelForDepthEstimation, DFineForObjectDetection,
+                                  RTDetrImageProcessor, SamImageProcessor, SamModel, SamProcessor)
         self.torch = torch
         cuda = torch.cuda.is_available()
         self.device = "cuda" if cuda else "cpu"
@@ -64,12 +103,14 @@ class PigDetector:
             torch.set_num_threads(max(2, (os.cpu_count() or 4) - 2))
         options = dict(local_files_only=True)
         status("Загружаю модели поиска свиней…")
-        detector, segmenter = model_path(root, DETECTOR), model_path(root, SEGMENTER)
+        detector, segmenter, depth = (model_path(root, source) for source in SOURCES)
         self.detector_processor = RTDetrImageProcessor.from_pretrained(detector, **options)
         self.detector = DFineForObjectDetection.from_pretrained(detector, use_safetensors=True, **options).eval().to(self.device)
         self.segment_images = SamImageProcessor.from_pretrained(segmenter, **options)
         self.segment_prompts = SamProcessor(self.segment_images)
         self.segmenter = SamModel.from_pretrained(segmenter, use_safetensors=True, **options).eval().to(self.device)
+        self.depth_processor = AutoImageProcessor.from_pretrained(depth, use_fast=False, **options)
+        self.depth_model = AutoModelForDepthEstimation.from_pretrained(depth, use_safetensors=True, **options).eval().to(self.device)
         names = self.detector.config.label2id
         self.thresholds = {names[PIG_LABEL]: PIG_THRESHOLD}
         self.thresholds.update({names[name]: LOOKALIKE_THRESHOLD for name in LOOKALIKE_LABELS if name in names})
@@ -92,7 +133,7 @@ class PigDetector:
         return boxes[kept], scores[kept]
 
     def outlines(self, bgr, boxes) -> list:
-        """Exact body pixels for every box, from one pass of the outline model over the picture."""
+        """Body pixels for every box, from one pass of the outline model over the picture."""
         if not len(boxes):
             return []
         torch = self.torch
@@ -107,3 +148,14 @@ class PigDetector:
         masks = self.segment_images.post_process_masks(output.pred_masks.cpu(), inputs["original_sizes"],
                                                        inputs["reshaped_input_sizes"])[0]
         return [fill_holes(mask[0].numpy().astype(bool)) for mask in masks]
+
+    def depth(self, bgr) -> np.ndarray:
+        """Estimated metres from the camera for every pixel of an ordinary picture."""
+        torch = self.torch
+        image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        with torch.no_grad():
+            inputs = self.depth_processor(images=image, return_tensors="pt").to(self.device)
+            predicted = self.depth_model(**inputs).predicted_depth
+            full = torch.nn.functional.interpolate(predicted.unsqueeze(1), size=bgr.shape[:2], mode="bilinear",
+                                                   align_corners=False)[0, 0]
+        return full.cpu().numpy().astype(np.float32)

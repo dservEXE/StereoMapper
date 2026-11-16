@@ -5,6 +5,7 @@ RT-DETR R18vd, PekingU/rtdetr_r18vd, Apache-2.0
 ViTPose+ small, usyd-community/vitpose-plus-small, Apache-2.0
 SlimSAM uniform-77, Zigeng/SlimSAM-uniform-77, Apache-2.0
 D-FINE medium Objects365, ustc-community/dfine-medium-obj365, Apache-2.0 (pig weighing tab)
+Depth Anything V2 Metric Indoor Small, depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf, Apache-2.0 (pig weighing tab)
 
 Optional accelerator packs. They are not bundled either: the application downloads them on request
 from the addresses in stereo/gpu_pack.py and checks each file by SHA-256.

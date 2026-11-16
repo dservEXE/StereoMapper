@@ -1,4 +1,4 @@
-"""The pig weighing tab: photographs and video files, analysed only while the tab is open."""
+"""The pig weighing tab: photographs, video files and the connected camera, analysed only while the tab is open."""
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
@@ -11,22 +11,28 @@ import numpy as np
 
 from .people_detection import download_models, models_ready
 from .pig_detection import SOURCES, missing_size_mb
-from .pig_weighing import PigSession, write_result
+from .pig_weighing import PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, PigSession, write_result
 from .ui import note
 from .version import VERSION
 
 NO_VALUE = "—"
 OUTLINE_OPACITY = .35
 SEGMENT_COLOR = (60, 220, 255)
+# Labels grow with the picture, which is shown reduced: 1400 pixels of width per unit of font size.
+LABEL_WIDTH_PER_UNIT = 1400
 PHOTO_TYPES = [("Фото", "*.jpg *.jpeg *.png *.bmp *.webp"), ("Все файлы", "*.*")]
 VIDEO_TYPES = [("Видео", "*.mp4 *.avi *.mov *.mkv *.m4v *.wmv"), ("Все файлы", "*.*")]
-VIEWS = {"Сверху": "top", "Сбоку": "side"}
-THICKNESS_TITLES = dict(top="Ширина, см", side="Высота туловища, см")
-COLUMNS = (("pig", "№", 46), ("mass", "Вес, кг", 76), ("range", "Диапазон, кг", 104), ("length", "Длина, см", 86),
-           ("thickness", THICKNESS_TITLES["top"], 150), ("girth", "Обхват, см", 92), ("frames", "Кадров", 70),
-           ("note", "Примечание", 260))
+COLUMNS = (("pig", "№", 46), ("mass", "Вес, кг", 80), ("range", "Диапазон, кг", 110), ("length", "Длина, см", 90),
+           ("girth", "Обхват груди, см", 130), ("frames", "Кадров", 70), ("note", "Примечание", 300))
 TABLE_ROWS = 5
 WRAP = 280
+SCALE_TEXTS = {
+    PICTURE: "Расстояния оценены по самому снимку, вес приблизительный. Отрезок известной длины его уточнит.",
+    SEGMENT: "Масштаб уточнён по отмеченному отрезку.",
+    STEREO: "Расстояния измерены стереокамерой, отрезок не нужен.",
+    SEGMENT_FAILED: "Отрезок измерить не удалось. Отметьте его на неподвижном, хорошо видном предмете.",
+}
+NO_CAMERA = "Сначала подключите камеры на вкладке «1 Камеры»."
 
 
 def parse_number(text) -> float | None:
@@ -38,30 +44,27 @@ def parse_number(text) -> float | None:
     return value if value > 0 else None
 
 
-def segment_scale(segment, length_cm) -> float | None:
-    """Metres per pixel from two marked points and the real distance between them."""
-    if not segment or not length_cm:
-        return None
-    (x0, y0), (x1, y1) = segment
-    pixels = float(np.hypot(x1 - x0, y1 - y0))
-    return length_cm / 100 / pixels if pixels >= 2 else None
-
-
 def draw_pigs(state, segment=None, points=()) -> np.ndarray:
     """Outlines, body lines and labels. Text is Latin because OpenCV fonts have no Cyrillic."""
     canvas = state.image.copy()
+    size = max(.5, canvas.shape[1] / LABEL_WIDTH_PER_UNIT)
+    weight = 2 if size >= .8 else 1
     for pig in state.pigs:
         if pig.outline is not None and pig.outline.shape == canvas.shape[:2]:
             tint = np.array(pig.color, np.float32)
             canvas[pig.outline] = (canvas[pig.outline] * (1 - OUTLINE_OPACITY) + tint * OUTLINE_OPACITY).astype(np.uint8)
+    for pig in state.pigs:
+        x, y = int(pig.box[0]), int(pig.box[1]) + 20
         if pig.shape is not None:
-            head, neck, rump = (tuple(int(value) for value in point) for point in (pig.shape.head, pig.shape.neck, pig.shape.rump))
+            neck, rump = (tuple(int(value) for value in point) for point in (pig.shape.neck, pig.shape.rump))
             cv2.line(canvas, neck, rump, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.line(canvas, head, neck, pig.color, 2, cv2.LINE_AA)
-        x0, y0 = int(pig.box[0]), int(pig.box[1])
-        text = f"#{pig.track_id}" + (f"  ~{pig.estimate.mass_kg:.0f} kg" if pig.estimate else "")
-        cv2.rectangle(canvas, (x0, max(0, y0 - 24)), (x0 + 12 * len(text) + 8, max(24, y0)), pig.color, -1)
-        cv2.putText(canvas, text, (x0 + 4, max(17, y0 - 7)), cv2.FONT_HERSHEY_SIMPLEX, .55, (20, 20, 20), 1, cv2.LINE_AA)
+            x, y = (neck[0] + rump[0]) // 2, (neck[1] + rump[1]) // 2
+        text = f"#{pig.track_id}" + (f" {pig.estimate.mass_kg:.0f} kg" if pig.estimate else "")
+        (width, height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size, weight)
+        left = max(0, min(canvas.shape[1] - width - 8, x - width // 2 - 4))
+        top = max(0, min(canvas.shape[0] - height - 8, y - height - 6))
+        cv2.rectangle(canvas, (left, top), (left + width + 8, top + height + 8), pig.color, -1)
+        cv2.putText(canvas, text, (left + 4, top + height + 3), cv2.FONT_HERSHEY_SIMPLEX, size, (20, 20, 20), weight, cv2.LINE_AA)
     marks = [tuple(int(value) for value in point) for point in (segment or points)]
     if len(marks) == 2:
         cv2.line(canvas, marks[0], marks[1], SEGMENT_COLOR, 2, cv2.LINE_AA)
@@ -71,14 +74,14 @@ def draw_pigs(state, segment=None, points=()) -> np.ndarray:
     return canvas
 
 
-def pig_row(pig, has_scale=True) -> tuple:
-    """One table line: number, weight, range, length, thickness, girth, frames, and why a value is missing."""
+def pig_row(pig) -> tuple:
+    """One table line: number, weight, range, length, girth, frames, and why a value is missing."""
     estimate = pig.estimate
     if estimate is None:
-        return (pig.track_id, *(NO_VALUE,) * 5, 0, pig.note or ("" if has_scale else "масштаб не задан"))
+        return (pig.track_id, *(NO_VALUE,) * 4, 0, pig.note)
     return (pig.track_id, f"{estimate.mass_kg:.0f}", f"{estimate.mass_low_kg:.0f}–{estimate.mass_high_kg:.0f}",
-            f"{estimate.length_m * 100:.0f}", f"{estimate.thickness_m * 100:.0f}", f"{estimate.girth_m * 100:.0f}",
-            estimate.samples, f"этот кадр пропущен: {pig.note}" if pig.note else "")
+            f"{estimate.length_m * 100:.0f}", f"{estimate.girth_m * 100:.0f}", estimate.samples,
+            f"этот кадр пропущен: {pig.note}" if pig.note else "")
 
 
 def time_text(seconds) -> str:
@@ -98,50 +101,50 @@ class PigTab:
         self.marking = False
         self.points = []
         self.segment = None
+        self.sent_reference = None
+        self.sink_worker = None
         self.message = tk.StringVar(value="Откройте вкладку, чтобы начать.")
         self.scale_text = tk.StringVar()
         self.metric_count = tk.StringVar(value=NO_VALUE)
         self.metric_mean = tk.StringVar(value=NO_VALUE)
-        self.view = tk.StringVar(value="Сверху")
         self.length = tk.StringVar()
-        self.camera_height = tk.StringVar()
-        heading(sidebar, "Взвесим свиней", "Откройте фото или видео, снятое сверху или сбоку. Свинья должна стоять "
-                "прямо и целиком помещаться в кадр. Вес считается по длине туловища и обхвату груди.")
+        heading(sidebar, "Взвесим свиней", "Откройте фото или видео или включите камеру. Программа сама оценит "
+                "расстояние до каждой свиньи и взвесит тех, кто стоит прямо и виден целиком.")
         self.build_metrics(sidebar)
         ttk.Label(sidebar, textvariable=self.message, style="Muted.TLabel", wraplength=WRAP, justify="left").pack(anchor="w", fill="x", pady=(0, 8))
-        self.photo_button = action(sidebar, "Открыть фото…", self.open_photo)
-        self.video_button = action(sidebar, "Открыть видео…", self.open_video)
-        controls = ttk.Frame(sidebar)
-        controls.pack(fill="x")
-        controls.columnconfigure((0, 1), weight=1, uniform="video")
-        self.play_button = ttk.Button(controls, text="Пауза", command=self.toggle_play, state="disabled")
+        self.sources = ttk.Frame(sidebar)
+        self.sources.pack(fill="x")
+        self.sources.columnconfigure((0, 1, 2), weight=1, uniform="source")
+        self.photo_button = ttk.Button(self.sources, text="Фото…", command=self.open_photo)
+        self.video_button = ttk.Button(self.sources, text="Видео…", command=self.open_video)
+        self.camera_button = ttk.Button(self.sources, text="Камера", command=self.open_camera)
+        for column, button in enumerate((self.photo_button, self.video_button, self.camera_button)):
+            button.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 3, 0 if column == 2 else 3), pady=2)
+        self.controls = ttk.Frame(sidebar)
+        self.controls.columnconfigure((0, 1), weight=1, uniform="video")
+        self.play_button = ttk.Button(self.controls, text="Пауза", command=self.toggle_play)
         self.play_button.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
-        self.rewind_button = ttk.Button(controls, text="Сначала", command=self.rewind, state="disabled")
+        self.rewind_button = ttk.Button(self.controls, text="Сначала", command=self.rewind)
         self.rewind_button.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
-        section(sidebar, "Масштаб")
-        note(sidebar, "Отметьте на кадре отрезок, длину которого знаете: ширину кормушки, станка или линейку. "
-                      "При съёмке сверху отрезок обычно лежит на полу, поэтому укажите и высоту камеры: "
-                      "без неё вес получится завышенным.")
+        self.controls_shown = False
+        section(sidebar, "Точность")
+        note(sidebar, "Чтобы вес был точнее, отметьте на кадре отрезок, длину которого знаете: ширину кормушки, "
+                      "станка или линейку.")
         self.mark_button = action(sidebar, "Отметить отрезок на кадре", self.start_marking)
         form = ttk.Frame(sidebar)
         form.pack(fill="x", pady=(4, 0))
         form.columnconfigure(1, weight=1)
         ttk.Label(form, text="Длина отрезка, см").grid(row=0, column=0, sticky="w", pady=2)
         ttk.Entry(form, textvariable=self.length, width=8).grid(row=0, column=1, sticky="e", pady=2)
-        ttk.Label(form, text="Съёмка").grid(row=1, column=0, sticky="w", pady=2)
-        ttk.Combobox(form, textvariable=self.view, values=list(VIEWS), state="readonly", width=9).grid(row=1, column=1, sticky="e", pady=2)
-        ttk.Label(form, text="Высота камеры, см").grid(row=2, column=0, sticky="w", pady=2)
-        self.height_entry = ttk.Entry(form, textvariable=self.camera_height, width=8)
-        self.height_entry.grid(row=2, column=1, sticky="e", pady=2)
         ttk.Label(sidebar, textvariable=self.scale_text, style="Muted.TLabel", wraplength=WRAP, justify="left").pack(anchor="w", fill="x", pady=(4, 0))
         ttk.Separator(sidebar).pack(fill="x", pady=10)
-        note(sidebar, "Вес — приблизительная оценка, на весах она пока не проверена. Номера действуют, пока открыто "
-                      "это фото или видео. Сохраняются только числа, без снимков.")
+        note(sidebar, "Вес — приблизительная оценка, на весах она пока не проверена. Номера действуют, пока открыт "
+                      "этот источник. Сохраняются только числа, без снимков.")
         self.download_button = action(footer, "Скачать модели", self.start_download, primary=True)
         self.reset_button = action(footer, "Начать замеры заново", self.reset)
         self.save_button = action(footer, "Сохранить результат", self.save)
         self.panel = panel_class(view, "Свиньи в кадре", self.clicked, empty="Здесь появятся найденные свиньи",
-                                 hint="Откройте фото или видео")
+                                 hint="Откройте фото или видео или включите камеру")
         self.panel.pack(fill="both", expand=True)
         results = ttk.Frame(view)
         results.pack(fill="x", pady=(8, 0))
@@ -154,10 +157,8 @@ class PigTab:
         self.table.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.table.pack(side="left", fill="x", expand=True)
-        for variable in (self.length, self.camera_height, self.view):
-            variable.trace_add("write", lambda *_: self.apply_scale())
+        self.length.trace_add("write", lambda *_: self.apply_reference())
         app.workflow.bind("<<NotebookTabChanged>>", lambda event: self.sync(), add="+")
-        self.apply_scale()
         self.show_download_state()
 
     def build_metrics(self, parent) -> None:
@@ -206,16 +207,21 @@ class PigTab:
             from .pig_detection import PigDetector
             self.session = PigSession(lambda status: PigDetector(self.app.directory, status))
             self.session.start()
-            self.apply_scale()
         if self.session is not None and selected != self.active:
             self.session.set_active(selected)
         self.active = selected
+        connected = bool(self.app.connected)
         # While this tab works, the cameras stay connected but depth and maps are not computed.
-        wanted = selected and bool(self.app.connected)
+        wanted = selected and connected
         if wanted != self.suspending:
             self.suspending = wanted
-            if self.app.connected:
+            if connected:
                 self.app.send("suspend", wanted)
+        if not connected:
+            self.sink_worker = None
+        elif self.camera_on() and self.app.worker is not self.sink_worker:
+            # The cameras were reconnected: the new camera thread does not know this tab yet.
+            self.attach_camera()
 
     def close(self) -> None:
         if self.session is not None:
@@ -227,6 +233,13 @@ class PigTab:
             self.message.set("Сначала скачайте модели кнопкой внизу." if not self.ready() else "Модели ещё загружаются.")
             return False
         return True
+
+    def camera_on(self) -> bool:
+        return self.session is not None and self.session.kind == "camera"
+
+    def attach_camera(self) -> None:
+        self.sink_worker = self.app.worker
+        self.app.send("frame_sink", self.session)
 
     def open_photo(self) -> None:
         if not self.need_session():
@@ -244,6 +257,16 @@ class PigTab:
             self.forget_segment()
             self.session.post("video", Path(path))
 
+    def open_camera(self) -> None:
+        if not self.need_session():
+            return
+        if not self.app.connected:
+            self.message.set(NO_CAMERA)
+            return
+        self.forget_segment()
+        self.session.post("camera")
+        self.attach_camera()
+
     def toggle_play(self) -> None:
         if self.session is not None and self.state is not None:
             self.session.post("play", not self.state.playing)
@@ -260,11 +283,11 @@ class PigTab:
     def forget_segment(self) -> None:
         """Another picture has another scale."""
         self.segment, self.points, self.marking = None, [], False
-        self.apply_scale()
+        self.apply_reference()
 
     def start_marking(self) -> None:
         if self.state is None or self.state.image is None:
-            self.message.set("Сначала откройте фото или видео.")
+            self.message.set("Сначала откройте фото или видео или включите камеру.")
             return
         self.marking, self.points = True, []
         if self.state.playing:
@@ -277,34 +300,33 @@ class PigTab:
         self.points.append((x, y))
         if len(self.points) == 2:
             self.segment, self.points, self.marking = tuple(self.points), [], False
-            self.apply_scale()
+            self.apply_reference()
             if not parse_number(self.length.get()):
                 self.message.set("Отрезок отмечен. Введите его длину в сантиметрах.")
         self.render()
 
-    def scale(self) -> float | None:
-        return segment_scale(self.segment, parse_number(self.length.get()))
+    def reference(self) -> tuple | None:
+        length = parse_number(self.length.get())
+        return (self.segment, length / 100) if self.segment and length else None
 
-    def apply_scale(self) -> None:
-        view = VIEWS.get(self.view.get(), "top")
-        self.height_entry.configure(state="normal" if view == "top" else "disabled")
-        self.table.heading("thickness", text=THICKNESS_TITLES[view])
-        scale = self.scale()
-        height = parse_number(self.camera_height.get()) if view == "top" else None
-        if scale is None:
-            self.scale_text.set("Масштаб не задан: размеры и вес пока не считаются.")
-        else:
-            text = f"Масштаб: 1 пиксель = {scale * 1000:.1f} мм."
-            if view == "top" and not height:
-                text += " Высота камеры не указана: если отрезок лежит на полу, вес завышен."
-            self.scale_text.set(text)
-        if self.session is not None:
-            self.session.post("scale", scale, height / 100 if height else None, view)
+    def apply_reference(self) -> None:
+        reference = self.reference()
+        if self.session is not None and reference != self.sent_reference:
+            self.sent_reference = reference
+            self.session.post("reference", reference)
 
     # Showing.
     def render(self) -> None:
         if self.state is not None and self.state.image is not None:
             self.panel.set(draw_pigs(self.state, self.segment, self.points))
+
+    def show_controls(self, shown) -> None:
+        if shown != self.controls_shown:
+            self.controls_shown = shown
+            if shown:
+                self.controls.pack(fill="x", after=self.sources)
+            else:
+                self.controls.pack_forget()
 
     def poll(self) -> None:
         try:
@@ -325,17 +347,19 @@ class PigTab:
             return
         self.shown, self.state = state.serial, state
         video = state.kind == "video"
-        self.play_button.configure(state="normal" if video else "disabled", text="Пауза" if state.playing else "Продолжить")
-        self.rewind_button.configure(state="normal" if video else "disabled")
+        self.show_controls(video)
+        self.play_button.configure(text="Пауза" if state.playing else "Продолжить")
         if not self.marking:
             progress = f" · {time_text(state.position_s)} из {time_text(state.duration_s)}" if video and state.duration_s else ""
-            speed = f" · {state.fps:.1f} кадра/с" if video and state.playing and state.fps else ""
-            self.message.set(state.message + progress + speed)
+            speed = f" · {state.fps:.1f} кадра/с" if state.fps and (state.playing or state.kind == "camera") else ""
+            lost = state.kind == "camera" and not self.app.connected
+            self.message.set("Камеры отключены. " + NO_CAMERA if lost else state.message + progress + speed)
+        self.scale_text.set(SCALE_TEXTS[state.scale_source] if state.image is not None else "")
         top = self.table.yview()[0]
         self.table.delete(*self.table.get_children())
-        has_scale = self.scale() is not None
-        for pig in state.pigs:
-            self.table.insert("", "end", values=pig_row(pig, has_scale))
+        # Measured animals first: with a dozen in view, the ones with a weight must not hide below the fold.
+        for pig in sorted(state.pigs, key=lambda pig: (pig.estimate is None, pig.track_id)):
+            self.table.insert("", "end", values=pig_row(pig))
         self.table.yview_moveto(top)
         masses = [pig.estimate.mass_kg for pig in state.pigs if pig.estimate is not None]
         self.metric_count.set(str(len(state.pigs)) if state.image is not None else NO_VALUE)
@@ -350,11 +374,8 @@ class PigTab:
         if state is None or not any(pig.estimate is not None for pig in state.pigs):
             self.message.set("Сохранять пока нечего: нет измеренных свиней.")
             return
-        view = VIEWS.get(self.view.get(), "top")
-        height = parse_number(self.camera_height.get()) if view == "top" else None
         folder = f"pigs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        setup = dict(version=VERSION, source=state.kind, view=view, scale_m_per_px=self.scale(),
-                     camera_height_m=height / 100 if height else None)
+        setup = dict(version=VERSION, source=state.kind, scale=state.scale_source)
         try:
             count = write_result(self.app.directory / "output" / folder / "result.json", state, setup)
         except OSError as error:

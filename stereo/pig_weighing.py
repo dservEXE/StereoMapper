@@ -1,7 +1,9 @@
-"""Pig weighing from a photograph or a video file: find the animals, number them, measure each.
+"""Pig weighing from a photograph, a video file or the connected camera.
 
-Runs in its own thread and works only while its tab is open. A photograph is analysed once. A
-video plays at its own speed and is analysed as fast as the computer manages, dropping frames.
+Each frame goes the same way: estimate the distance to every pixel, find the animals, number them,
+measure each in space. Runs in its own thread and works only while its tab is open. A photograph
+is analysed once; a video plays at its own speed and is analysed as fast as the computer manages,
+dropping frames; the camera is asked for a frame only when the previous one is done.
 """
 from dataclasses import dataclass, field, replace
 import itertools
@@ -9,12 +11,15 @@ import json
 from pathlib import Path
 from threading import Condition, Thread
 import time
+from typing import NamedTuple
 
 import cv2
 import numpy as np
 
-from .pig_detection import overlap
-from .pig_measure import PigAccumulator, PigEstimate, PigShape, pig_shape
+from .pig_detection import distinct_outlines, overlap
+from .pig_measure import PigAccumulator, PigEstimate, PigShape, measure_pig, pig_shape
+from .pig_scene import (Floor, assumed_focal, fit_floor, floor_candidates, hidden_behind, scene_points, segment_length,
+                        stereo_scale)
 
 MAX_SIDE = 1280
 MEMORY_S = 5.
@@ -23,10 +28,13 @@ EDGE_MARGIN_PX = 3
 IDLE_WAIT_S = .5
 DEFAULT_FPS = 25.
 READING_ROWS = 3
+FLOOR_CHECK_POINTS = 300
+FACTOR_LIMITS = (.1, 10.)
 PALETTE = ((80, 200, 255), (120, 230, 120), (255, 160, 90), (200, 130, 255), (90, 220, 220), (130, 130, 255))
-START_HINT = "Откройте фото или видео со свиньями."
-NO_SCALE_HINT = "Отметьте на кадре отрезок известной длины, чтобы получить размеры и вес."
-CUT, NO_OUTLINE, BAD_POSE = "обрезана краем кадра", "контур не найден", "поза не подходит для замера"
+START_HINT = "Откройте фото или видео или включите камеру."
+CUT, NO_OUTLINE, HIDDEN = "обрезана краем кадра", "контур не найден", "закрыта другой свиньёй"
+# Where the scale of the current frame comes from.
+PICTURE, SEGMENT, STEREO, SEGMENT_FAILED = "picture", "segment", "stereo", "segment_failed"
 
 
 def read_image(path) -> np.ndarray | None:
@@ -102,6 +110,24 @@ class PigTracker:
         return result
 
 
+class CameraFrame(NamedTuple):
+    """A frame from the connected camera; z is real depth from a calibrated stereo pair, if there is one."""
+    image: np.ndarray
+    z: np.ndarray | None = None
+    valid: np.ndarray | None = None
+    focal: float | None = None
+    centre: tuple | None = None
+
+
+class Scene(NamedTuple):
+    """What is known about the last analysed frame, kept so the scale can change without a new pass."""
+    image: np.ndarray
+    points: np.ndarray
+    focal: float
+    floor: Floor | None
+    source: str
+
+
 @dataclass(frozen=True)
 class PigView:
     track_id: int
@@ -124,6 +150,7 @@ class PigState:
     position_s: float = 0.
     duration_s: float = 0.
     fps: float = 0.
+    scale_source: str = PICTURE
     ready: bool = False
     failed: bool = False
     serial: int = 0
@@ -133,7 +160,7 @@ def pig_result(pig) -> dict:
     estimate = pig.estimate
     return dict(label=pig.track_id, mass_kg=round(estimate.mass_kg, 1), mass_low_kg=round(estimate.mass_low_kg, 1),
                 mass_high_kg=round(estimate.mass_high_kg, 1), length_m=round(estimate.length_m, 3),
-                thickness_m=round(estimate.thickness_m, 3), girth_m=round(estimate.girth_m, 3), samples=estimate.samples)
+                girth_m=round(estimate.girth_m, 3), samples=estimate.samples)
 
 
 def write_result(path, state, setup) -> int:
@@ -151,19 +178,21 @@ class PigSession(Thread):
         self.detector_factory = detector_factory
         self.wake = Condition()
         self.pending = []
+        self.submitted = None
         self.active = False
         self.stopping = False
         self.state = PigState(message="Загружаю модели поиска свиней…")
         # Everything below belongs to the thread.
-        self.scale, self.camera_height, self.view = None, None, "top"
+        self.reference = None
         self.tracker = PigTracker()
-        self.source = self.frame = self.video = self.clock = None
+        self.source = self.video = self.clock = self.scene = None
         self.entries = []
+        self.scale_source = PICTURE
         self.kind = None
         self.playing = self.finished = False
         self.index, self.fps, self.frames, self.rate = 0, DEFAULT_FPS, 0, 0.
 
-    # Called from the interface.
+    # Called from the interface and from the camera thread.
     def post(self, *command) -> None:
         with self.wake:
             self.pending.append(command)
@@ -179,6 +208,15 @@ class PigSession(Thread):
             self.stopping = True
             self.wake.notify()
 
+    def wants_frame(self) -> bool:
+        """The camera thread asks before preparing a frame, so nothing is computed in vain."""
+        return self.active and self.kind == "camera" and self.submitted is None and not self.stopping
+
+    def submit(self, image, z=None, valid=None, focal=None, centre=None) -> None:
+        with self.wake:
+            self.submitted = CameraFrame(image, z, valid, focal, centre)
+            self.wake.notify()
+
     # The thread.
     def publish(self, **changes) -> None:
         self.state = replace(self.state, serial=self.state.serial + 1, **changes)
@@ -188,6 +226,9 @@ class PigSession(Thread):
 
     def due(self) -> bool:
         return self.running() and (self.clock is None or time.perf_counter() >= self.clock + self.index / self.fps)
+
+    def frame_waiting(self) -> bool:
+        return self.active and self.kind == "camera" and self.submitted is not None
 
     def run(self) -> None:
         try:
@@ -204,7 +245,7 @@ class PigSession(Thread):
 
     def step(self, detector) -> bool:
         with self.wake:
-            while not self.stopping and not self.pending and not self.due():
+            while not self.stopping and not self.pending and not self.due() and not self.frame_waiting():
                 if not self.running():
                     # After a pause the video continues from where it stopped, not from where the clock went.
                     self.clock = None
@@ -225,15 +266,19 @@ class PigSession(Thread):
                 frame = self.read_frame()
                 if frame is not None:
                     self.analyse(detector, frame, self.index / self.fps)
+            elif self.frame_waiting():
+                with self.wake:
+                    camera, self.submitted = self.submitted, None
+                self.analyse(detector, camera.image, time.monotonic(), camera)
         except Exception as error:  # noqa: BLE001 - one bad frame must not end the session.
             self.publish(message=f"Кадр не обработан: {error}")
         return True
 
     def handle(self, name, *values) -> np.ndarray | None:
         """Apply one command; return a still picture to analyse now, if it calls for one."""
-        if name == "scale":
-            self.scale, self.camera_height, self.view = values
-            self.show()
+        if name == "reference":
+            self.reference = values[0]
+            self.restart_measurements()
         elif name == "play":
             if values[0] and self.finished:
                 self.rewind()
@@ -257,7 +302,22 @@ class PigSession(Thread):
             return self.source
         elif name == "video":
             self.open_video(values[0])
+        elif name == "camera":
+            self.close_video()
+            self.kind, self.source, self.tracker, self.entries, self.scene = "camera", None, PigTracker(), [], None
+            with self.wake:
+                self.submitted = None
+            self.publish(kind="camera", playing=False, finished=False, image=None, pigs=(), position_s=0., duration_s=0.,
+                         message="Жду кадр с камеры…")
         return None
+
+    def restart_measurements(self) -> None:
+        """A new scale makes earlier frames incomparable: measure the current one again from scratch."""
+        for track, *_ in self.entries:
+            track.accumulator = PigAccumulator()
+        if self.scene is not None:
+            self.measure()
+            self.show()
 
     def open_video(self, path) -> None:
         self.close_video()
@@ -270,7 +330,7 @@ class PigSession(Thread):
         self.video, self.kind, self.source = video, "video", None
         self.fps = float(fps) if fps and np.isfinite(fps) and fps > 0 else DEFAULT_FPS
         self.frames = max(0, int(video.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
-        self.tracker, self.entries, self.frame = PigTracker(), [], None
+        self.tracker, self.entries, self.scene = PigTracker(), [], None
         self.index, self.clock, self.playing, self.finished = 0, None, True, False
         self.publish(kind="video", playing=True, finished=False, image=None, pigs=(), position_s=0.,
                      duration_s=self.frames / self.fps, message="Видео открыто, ищу свиней…")
@@ -302,46 +362,74 @@ class PigSession(Thread):
         self.index += 1
         return fitted(frame)
 
-    def analyse(self, detector, image, now) -> None:
+    def analyse(self, detector, image, now, camera=None) -> None:
         started = time.perf_counter()
-        boxes, _ = detector.detect(image)
-        boxes = boxes[reading_order(boxes, image.shape[0])]
-        masks = detector.outlines(image, boxes)
+        depth = detector.depth(image)
+        focal, centre, source = assumed_focal(image.shape), None, PICTURE
+        if camera is not None and camera.z is not None and camera.focal:
+            focal, centre = camera.focal, camera.centre
+            scale = stereo_scale(depth, camera.z, camera.valid)
+            if scale is not None:
+                depth, source = depth * scale, STEREO
+        points = scene_points(depth, focal, centre)
+        boxes, scores = detector.detect(image)
+        order = reading_order(boxes, image.shape[0])
+        boxes, scores = boxes[order], scores[order]
+        found = distinct_outlines(detector.outlines(image, boxes), scores)
+        boxes, masks = boxes[[index for index, _ in found]], [mask for _, mask in found]
         tracks = self.tracker.update(boxes, now)
+        animals = [points[mask][::max(1, int(mask.sum()) // FLOOR_CHECK_POINTS)].astype(np.float64) for mask in masks]
+        floor = fit_floor(points, floor_candidates(masks), animals)
         height, width = image.shape[:2]
         self.entries = []
-        for track, box, mask in zip(tracks, boxes, masks):
-            cut = (box[0] <= EDGE_MARGIN_PX or box[1] <= EDGE_MARGIN_PX
-                   or box[2] >= width - EDGE_MARGIN_PX or box[3] >= height - EDGE_MARGIN_PX)
-            shape = pig_shape(mask)
-            if cut:
-                note = CUT
-            elif shape is None:
-                note = NO_OUTLINE
-            else:
-                note = "" if track.accumulator.add(shape) else BAD_POSE
-            self.entries.append((track, tuple(float(value) for value in box), mask, shape, note))
-        self.frame = image
+        for track, box, mask, hidden in zip(tracks, boxes, masks, hidden_behind(masks, points)):
+            cut = bool(box[0] <= EDGE_MARGIN_PX or box[1] <= EDGE_MARGIN_PX
+                       or box[2] >= width - EDGE_MARGIN_PX or box[3] >= height - EDGE_MARGIN_PX)
+            blocked = CUT if cut else HIDDEN if hidden else ""
+            self.entries.append([track, tuple(float(value) for value in box), mask, pig_shape(mask), blocked, ""])
+        self.scene = Scene(image, points, focal, floor, source)
+        self.measure()
         self.rate = 1 / max(1e-3, time.perf_counter() - started)
         self.show()
 
+    def measure(self) -> None:
+        """Add one measurement of the current frame to every animal that can be measured in it."""
+        scene = self.scene
+        factor, self.scale_source = 1., scene.source
+        if self.reference is not None:
+            segment, true_length = self.reference
+            seen = segment_length(scene.points, segment)
+            if seen and FACTOR_LIMITS[0] <= true_length / seen <= FACTOR_LIMITS[1]:
+                factor, self.scale_source = true_length / seen, SEGMENT
+            else:
+                self.scale_source = SEGMENT_FAILED
+        for entry in self.entries:
+            track, _, mask, shape, blocked, _ = entry
+            if blocked:
+                entry[5] = blocked
+            elif shape is None:
+                entry[5] = NO_OUTLINE
+            else:
+                sample, entry[5] = measure_pig(shape, scene.points, mask, scene.focal, scene.floor)
+                if sample is not None:
+                    track.accumulator.add(sample, factor)
+
     def show(self) -> None:
-        """Publish the last analysed frame with estimates at the current scale."""
-        pigs = tuple(PigView(track.track_id, box, track.color, mask, shape,
-                             track.accumulator.estimate(self.scale, self.camera_height, self.view), note)
-                     for track, box, mask, shape, note in self.entries)
-        if self.frame is None:
+        """Publish the last analysed frame with what is known about every animal in it."""
+        calibrated = self.scale_source in (SEGMENT, STEREO)
+        pigs = tuple(PigView(track.track_id, box, track.color, mask, shape, track.accumulator.estimate(calibrated), note)
+                     for track, box, mask, shape, _, note in self.entries)
+        if self.scene is None:
             message = self.state.message
         elif not pigs:
             message = "Свиней на кадре не найдено."
-        elif not self.scale:
-            message = f"Найдено свиней: {len(pigs)}. {NO_SCALE_HINT}"
         else:
             measured = sum(pig.estimate is not None for pig in pigs)
             message = f"Найдено свиней: {len(pigs)}, измерено: {measured}."
-        if self.frame is not None and self.finished:
+        if self.scene is not None and self.finished:
             message += " Видео закончилось."
-        self.publish(image=self.frame, pigs=pigs, message=message, kind=self.kind, playing=self.playing,
-                     finished=self.finished, position_s=self.index / self.fps if self.kind == "video" else 0.,
-                     duration_s=self.frames / self.fps if self.kind == "video" else 0.,
-                     fps=self.rate if self.kind == "video" else 0.)
+        video = self.kind == "video"
+        self.publish(image=None if self.scene is None else self.scene.image, pigs=pigs, message=message, kind=self.kind,
+                     playing=self.playing, finished=self.finished, position_s=self.index / self.fps if video else 0.,
+                     duration_s=self.frames / self.fps if video else 0., scale_source=self.scale_source,
+                     fps=self.rate if self.kind in ("video", "camera") else 0.)

@@ -20,6 +20,13 @@ def write_image(path, image):
     encoded.tofile(str(path))
 
 
+def latest_calibration(root) -> Path | None:
+    """The most recently saved calibration of this program: the current one or one kept with its series."""
+    data = Path(root) / "data"
+    found = [path for path in (data / "calibration.npz", *data.glob("calibration_*/calibration.npz")) if path.is_file()]
+    return max(found, key=lambda path: path.stat().st_mtime) if found else None
+
+
 @dataclass
 class Calibration:
     size: tuple

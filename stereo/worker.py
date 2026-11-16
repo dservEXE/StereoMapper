@@ -50,6 +50,7 @@ class CameraWorker(Thread):
         self.signal_filter = signal_filter
         self.weighing_stopping = None
         self.suspended = False
+        self.frame_sink = None
         self.weighing = None
         if self.is_tof:
             max_depth, map_stride = min(max_depth, TOF_MAX_RANGE_M), 1
@@ -264,6 +265,23 @@ class CameraWorker(Thread):
             self.depth_enabled = True
             self.emit("depth_enabled", True)
 
+    def feed_sink(self):
+        """Give the open tab the frame it asked for, with real depth when there is a calibration."""
+        sink = self.frame_sink
+        if sink is None or self.raw is None or not sink.wants_frame():
+            return
+        try:
+            if self.engine is None or self.calibration_busy:
+                sink.submit(self.raw[0])
+                return
+            self.engine.speed_priority = True
+            frame = self.engine.compute(*self.raw)
+            K = self.engine.calibration.P1[:, :3]
+            z = frame.points[:, :, 2]
+            sink.submit(frame.left, z, frame.valid & np.isfinite(z) & (z > 0), float(K[0, 0]), (float(K[0, 2]), float(K[1, 2])))
+        except Exception as error:  # noqa: BLE001 - a bad frame must not stop the cameras.
+            self.emit("error", f"Кадр для вкладки не подготовлен: {error}")
+
     def stop_weighing(self):
         if self.weighing is not None:
             self.weighing.stop_event.set()
@@ -279,7 +297,7 @@ class CameraWorker(Thread):
             raise ValueError("MaixSense измеряет глубину сама: стереокалибровка и съёмка доски ей не нужны.")
         if self.calibration_busy and name in ('calibrate','capture','new_series','board_settings','load','switch_resolution','restore_series','precision','scan_start'):
             raise ValueError("Расчёт калибровки ещё идёт; дождитесь результата. Видео продолжает работать.")
-        if self.scan and name not in ('scan_stop','scan_extend','distance_report','weighing','weighing_reset','weighing_save','suspend'):
+        if self.scan and name not in ('scan_stop','scan_extend','distance_report','weighing','weighing_reset','weighing_save','suspend','frame_sink'):
             raise ValueError("Идёт объёмный снимок. Завершите его в окне накопления перед этой операцией.")
         if name == "depth":
             if value and self.engine is None:
@@ -304,6 +322,8 @@ class CameraWorker(Thread):
         elif name == "suspend":
             # Another tab works alone: the cameras stay connected, nothing is computed.
             self.suspended = bool(value)
+        elif name == "frame_sink":
+            self.frame_sink = value
         elif name == "weighing_reset":
             if self.weighing:
                 self.weighing.reset()
@@ -677,6 +697,7 @@ class CameraWorker(Thread):
                     except Exception as error:
                         self.emit("error", str(error))
                 if self.suspended and not self.scan:
+                    self.feed_sink()
                     time.sleep(SUSPENDED_PAUSE_S)
                     continue
                 tracking = "Накопление выключено"
