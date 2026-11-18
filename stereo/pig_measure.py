@@ -76,6 +76,12 @@ class PigEstimate(NamedTuple):
     mass_high_kg: float
     samples: int
 
+    def scaled(self, factor) -> "PigEstimate":
+        """The same animal with every size `factor` times larger, so the weight is its cube times heavier."""
+        cube = factor ** 3
+        return PigEstimate(self.length_m * factor, self.girth_m * factor, self.mass_kg * cube, self.mass_low_kg * cube,
+                           self.mass_high_kg * cube, self.samples)
+
 
 def largest_part(mask) -> np.ndarray:
     count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)

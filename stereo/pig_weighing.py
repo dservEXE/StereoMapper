@@ -2,13 +2,22 @@
 
 Each frame goes the same way: estimate the distance to every pixel, find the animals, number them,
 measure each in space. Runs in its own thread and works only while its tab is open. A photograph
-is analysed once; a video plays at its own speed and is analysed as fast as the computer manages,
-dropping frames; the camera is asked for a frame only when the previous one is done.
+is analysed once. A video is analysed frame by frame, every one of them, as fast as the computer
+manages; then it is written again with every frame marked: outlines, body lines and the final
+weight of each animal. The camera is asked for a frame only when the previous one is done.
+
+The depth model only guesses how large things are in an ordinary picture, and the guess can be
+wrong several times over. A stereo pair, a segment of known length or one animal weighed on
+scales fixes the scale; the last two apply to every animal seen, before and after.
 """
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 import itertools
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from threading import Condition, Thread
 import time
 from typing import NamedTuple
@@ -17,6 +26,7 @@ import cv2
 import numpy as np
 
 from .pig_detection import distinct_outlines, overlap
+from .pig_drawing import draw_marks, label_text, outline_contours
 from .pig_measure import PigAccumulator, PigEstimate, PigShape, measure_pig, pig_shape
 from .pig_scene import (Floor, assumed_focal, fit_floor, floor_candidates, hidden_behind, scene_points, segment_length,
                         stereo_scale)
@@ -30,11 +40,17 @@ DEFAULT_FPS = 25.
 READING_ROWS = 3
 FLOOR_CHECK_POINTS = 300
 FACTOR_LIMITS = (.1, 10.)
+RATE_SMOOTHING = .2
+RENDER_BATCH = 8
+MARKED_SUFFIX = "_разметка"
 PALETTE = ((80, 200, 255), (120, 230, 120), (255, 160, 90), (200, 130, 255), (90, 220, 220), (130, 130, 255))
 START_HINT = "Откройте фото или видео или включите камеру."
 CUT, NO_OUTLINE, HIDDEN = "обрезана краем кадра", "контур не найден", "закрыта другой свиньёй"
-# Where the scale of the current frame comes from.
+WEIGHED = "взвешена на весах"
+# Where the scale comes from.
 PICTURE, SEGMENT, STEREO, SEGMENT_FAILED = "picture", "segment", "stereo", "segment_failed"
+WEIGHT, WEIGHT_FAILED = "weight", "weight_failed"
+CALIBRATED = (SEGMENT, STEREO, WEIGHT)
 
 
 def read_image(path) -> np.ndarray | None:
@@ -128,29 +144,68 @@ class Scene(NamedTuple):
     source: str
 
 
-@dataclass(frozen=True)
-class PigView:
+@dataclass
+class Entry:
+    """One animal in the current frame."""
+    track: PigTrack
+    box: tuple
+    mask: np.ndarray
+    shape: PigShape | None
+    blocked: str
+    contours: tuple
+    note: str = ""
+
+
+class Mark(NamedTuple):
+    """What is drawn over one animal in one frame of the marked-up video, in analysed pixels."""
     track_id: int
     box: tuple
     color: tuple
-    outline: np.ndarray | None
+    contours: tuple
+    shape: PigShape | None
+
+
+@dataclass(frozen=True)
+class PigView:
+    """One animal in the frame on screen."""
+    track_id: int
+    box: tuple
+    color: tuple
+    contours: tuple
     shape: PigShape | None
     estimate: PigEstimate | None
     note: str
 
 
 @dataclass(frozen=True)
+class PigRow:
+    """One animal seen since the source was opened, for the table and the saved result."""
+    track_id: int
+    estimate: PigEstimate | None
+    note: str
+    in_view: bool
+
+
+@dataclass(frozen=True)
 class PigState:
     image: np.ndarray | None = None
     pigs: tuple = ()
+    animals: tuple = ()
     message: str = ""
     kind: str | None = None
     playing: bool = False
     finished: bool = False
     position_s: float = 0.
     duration_s: float = 0.
+    frame: int = 0
+    frames: int = 0
     fps: float = 0.
     scale_source: str = PICTURE
+    camera_height_m: float | None = None
+    weighed_pig: int | None = None
+    device: str = ""
+    rendering: float | None = None
+    video_file: str = ""
     ready: bool = False
     failed: bool = False
     serial: int = 0
@@ -163,19 +218,41 @@ def pig_result(pig) -> dict:
                 girth_m=round(estimate.girth_m, 3), samples=estimate.samples)
 
 
-def write_result(path, state, setup) -> int:
+def write_result(path, animals, setup) -> int:
     """Write numbers only, no pictures. Returns how many animals were saved."""
-    pigs = [pig_result(pig) for pig in state.pigs if pig.estimate is not None]
+    pigs = [pig_result(pig) for pig in animals if pig.estimate is not None]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(setup, pigs=pigs), ensure_ascii=False, indent=2), encoding="utf-8")
     return len(pigs)
 
 
+def result_folder(output) -> Path:
+    return Path(output) / f"pigs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def open_writer(path, fps, width, height) -> tuple:
+    """A video writer and the file it really writes to.
+
+    The writer is asked for the path itself; should the codec library refuse its letters, a plain
+    temporary name is used and the file is moved into place when done.
+    """
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    spare = Path(tempfile.gettempdir()) / f"pigs_{os.getpid()}_{time.monotonic_ns()}.mp4"
+    for candidate in (Path(path), spare):
+        writer = cv2.VideoWriter(str(candidate), fourcc, float(fps), (int(width), int(height)))
+        if writer.isOpened():
+            return writer, candidate
+        writer.release()
+        candidate.unlink(missing_ok=True)
+    raise OSError("не удалось создать файл видео")
+
+
 class PigSession(Thread):
-    def __init__(self, detector_factory):
+    def __init__(self, detector_factory, output=None):
         super().__init__(daemon=True, name="pig-weighing")
         self.detector_factory = detector_factory
+        self.output = None if output is None else Path(output)
         self.wake = Condition()
         self.pending = []
         self.submitted = None
@@ -184,13 +261,19 @@ class PigSession(Thread):
         self.state = PigState(message="Загружаю модели поиска свиней…")
         # Everything below belongs to the thread.
         self.reference = None
+        self.segment_factor = None
+        self.known = None
         self.tracker = PigTracker()
-        self.source = self.video = self.clock = self.scene = None
+        self.source = self.video = self.scene = self.path = None
         self.entries = []
-        self.scale_source = PICTURE
+        self.seen, self.notes, self.marks = {}, {}, {}
+        self.frame_source = PICTURE
         self.kind = None
         self.playing = self.finished = False
         self.index, self.fps, self.frames, self.rate = 0, DEFAULT_FPS, 0, 0.
+        self.shrink = 1.
+        self.render = None
+        self.video_file = ""
 
     # Called from the interface and from the camera thread.
     def post(self, *command) -> None:
@@ -224,8 +307,8 @@ class PigSession(Thread):
     def running(self) -> bool:
         return self.active and self.playing and self.video is not None
 
-    def due(self) -> bool:
-        return self.running() and (self.clock is None or time.perf_counter() >= self.clock + self.index / self.fps)
+    def rendering(self) -> bool:
+        return self.active and self.render is not None
 
     def frame_waiting(self) -> bool:
         return self.active and self.kind == "camera" and self.submitted is not None
@@ -236,22 +319,20 @@ class PigSession(Thread):
         except Exception as error:  # noqa: BLE001 - a missing or damaged model must reach the interface.
             self.publish(message=f"Не удалось загрузить модели: {error}", failed=True)
             return
-        self.publish(message=f"{START_HINT} Считает {detector.device_label}.", ready=True)
+        label = getattr(detector, "device_label", "")
+        self.publish(message=START_HINT, device=label, ready=True)
         try:
             while self.step(detector):
                 pass
         finally:
+            self.stop_render()
             self.close_video()
 
     def step(self, detector) -> bool:
         with self.wake:
-            while not self.stopping and not self.pending and not self.due() and not self.frame_waiting():
-                if not self.running():
-                    # After a pause the video continues from where it stopped, not from where the clock went.
-                    self.clock = None
-                    self.wake.wait(IDLE_WAIT_S)
-                else:
-                    self.wake.wait(max(.005, self.clock + self.index / self.fps - time.perf_counter()))
+            while (not self.stopping and not self.pending and not self.running() and not self.frame_waiting()
+                   and not self.rendering()):
+                self.wake.wait(IDLE_WAIT_S)
             if self.stopping:
                 return False
             commands, self.pending = self.pending, []
@@ -265,11 +346,13 @@ class PigSession(Thread):
             elif self.running():
                 frame = self.read_frame()
                 if frame is not None:
-                    self.analyse(detector, frame, self.index / self.fps)
+                    self.analyse(detector, frame, (self.index - 1) / self.fps)
             elif self.frame_waiting():
                 with self.wake:
                     camera, self.submitted = self.submitted, None
                 self.analyse(detector, camera.image, time.monotonic(), camera)
+            elif self.rendering():
+                self.render_step()
         except Exception as error:  # noqa: BLE001 - one bad frame must not end the session.
             self.publish(message=f"Кадр не обработан: {error}")
         return True
@@ -277,8 +360,12 @@ class PigSession(Thread):
     def handle(self, name, *values) -> np.ndarray | None:
         """Apply one command; return a still picture to analyse now, if it calls for one."""
         if name == "reference":
-            self.reference = values[0]
-            self.restart_measurements()
+            self.reference, self.segment_factor = values[0], None
+            self.calibrate_segment()
+            self.show()
+        elif name == "known":
+            self.known = values[0]
+            self.show()
         elif name == "play":
             if values[0] and self.finished:
                 self.rewind()
@@ -286,11 +373,16 @@ class PigSession(Thread):
             self.publish(playing=self.playing)
         elif name == "rewind" and self.video is not None:
             self.rewind()
+        elif name == "render":
+            self.start_render()
+            self.show()
         elif name == "reset":
-            self.tracker = PigTracker()
+            if self.kind == "video" and self.video is not None:
+                self.rewind()
+                return None
+            self.forget_animals()
             if self.kind == "photo":
                 return self.source
-            self.entries = []
             self.show()
         elif name == "photo":
             self.close_video()
@@ -298,26 +390,35 @@ class PigSession(Thread):
             if image is None:
                 self.publish(message="Не удалось открыть фото: файл повреждён или это не изображение.")
                 return None
-            self.kind, self.source, self.tracker = "photo", fitted(image), PigTracker()
+            self.kind, self.source = "photo", fitted(image)
+            self.forget_animals()
             return self.source
         elif name == "video":
             self.open_video(values[0])
         elif name == "camera":
             self.close_video()
-            self.kind, self.source, self.tracker, self.entries, self.scene = "camera", None, PigTracker(), [], None
+            self.kind, self.source, self.scene = "camera", None, None
+            self.forget_animals()
             with self.wake:
                 self.submitted = None
-            self.publish(kind="camera", playing=False, finished=False, image=None, pigs=(), position_s=0., duration_s=0.,
-                         message="Жду кадр с камеры…")
+            self.publish(kind="camera", playing=False, finished=False, image=None, pigs=(), animals=(), position_s=0.,
+                         duration_s=0., frame=0, frames=0, rendering=None, video_file="", message="Жду кадр с камеры…")
         return None
 
-    def restart_measurements(self) -> None:
-        """A new scale makes earlier frames incomparable: measure the current one again from scratch."""
-        for track, *_ in self.entries:
-            track.accumulator = PigAccumulator()
-        if self.scene is not None:
-            self.measure()
-            self.show()
+    def forget_animals(self) -> None:
+        """New numbers from 1, nothing measured."""
+        self.tracker = PigTracker()
+        self.entries, self.seen, self.notes, self.marks = [], {}, {}, {}
+        self.rate = 0.
+
+    def calibrate_segment(self) -> None:
+        """How many times the marked segment is longer than it is seen in the frame on screen now."""
+        if self.reference is None or self.scene is None:
+            return
+        segment, true_length = self.reference
+        seen = segment_length(self.scene.points, segment)
+        factor = true_length / seen if seen else 0.
+        self.segment_factor = factor if FACTOR_LIMITS[0] <= factor <= FACTOR_LIMITS[1] else 0.
 
     def open_video(self, path) -> None:
         self.close_video()
@@ -327,40 +428,41 @@ class PigSession(Thread):
             self.publish(message="Не удалось открыть видео: формат не поддерживается или файл повреждён.")
             return
         fps = video.get(cv2.CAP_PROP_FPS)
-        self.video, self.kind, self.source = video, "video", None
+        self.video, self.path, self.kind, self.source, self.scene = video, Path(path), "video", None, None
         self.fps = float(fps) if fps and np.isfinite(fps) and fps > 0 else DEFAULT_FPS
         self.frames = max(0, int(video.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
-        self.tracker, self.entries, self.scene = PigTracker(), [], None
-        self.index, self.clock, self.playing, self.finished = 0, None, True, False
-        self.publish(kind="video", playing=True, finished=False, image=None, pigs=(), position_s=0.,
-                     duration_s=self.frames / self.fps, message="Видео открыто, ищу свиней…")
+        self.forget_animals()
+        self.index, self.playing, self.finished, self.shrink, self.video_file = 0, True, False, 1., ""
+        self.publish(kind="video", playing=True, finished=False, image=None, pigs=(), animals=(), position_s=0.,
+                     duration_s=self.frames / self.fps, frame=0, frames=self.frames, rendering=None, video_file="",
+                     message="Видео открыто, ищу свиней…")
 
     def rewind(self) -> None:
+        self.stop_render()
         self.video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self.tracker, self.entries = PigTracker(), []
-        self.index, self.clock, self.playing, self.finished = 0, None, True, False
-        self.publish(playing=True, finished=False, position_s=0.)
+        self.forget_animals()
+        self.index, self.playing, self.finished, self.video_file = 0, True, False, ""
+        self.publish(playing=True, finished=False, position_s=0., frame=0, rendering=None, video_file="")
 
     def close_video(self) -> None:
+        self.stop_render()
         if self.video is not None:
             self.video.release()
         self.video, self.playing, self.finished = None, False, False
 
     def read_frame(self) -> np.ndarray | None:
-        """The frame that is due now; the ones the analysis had no time for are skipped."""
-        now = time.perf_counter()
-        if self.clock is None:
-            self.clock = now - self.index / self.fps
-        target = max(self.index, int((now - self.clock) * self.fps))
-        while self.index < target and self.video.grab():
-            self.index += 1
+        """The next frame of the video: every one is analysed, none is skipped."""
         ok, frame = self.video.read()
         if not ok:
             self.playing, self.finished = False, True
-            self.publish(playing=False, finished=True, message="Видео закончилось. Нажмите «Сначала», чтобы повторить.")
+            self.frames = self.index
+            self.start_render()
+            self.show()
             return None
         self.index += 1
-        return fitted(frame)
+        small = fitted(frame)
+        self.shrink = frame.shape[1] / small.shape[1]
+        return small
 
     def analyse(self, detector, image, now, camera=None) -> None:
         started = time.perf_counter()
@@ -385,51 +487,148 @@ class PigSession(Thread):
         for track, box, mask, hidden in zip(tracks, boxes, masks, hidden_behind(masks, points)):
             cut = bool(box[0] <= EDGE_MARGIN_PX or box[1] <= EDGE_MARGIN_PX
                        or box[2] >= width - EDGE_MARGIN_PX or box[3] >= height - EDGE_MARGIN_PX)
-            blocked = CUT if cut else HIDDEN if hidden else ""
-            self.entries.append([track, tuple(float(value) for value in box), mask, pig_shape(mask), blocked, ""])
+            self.entries.append(Entry(track, tuple(float(value) for value in box), mask, pig_shape(mask),
+                                      CUT if cut else HIDDEN if hidden else "", outline_contours(mask)))
+            self.seen[track.track_id] = track
         self.scene = Scene(image, points, focal, floor, source)
+        self.frame_source = source
+        if self.reference is not None and self.segment_factor is None:
+            self.calibrate_segment()
         self.measure()
-        self.rate = 1 / max(1e-3, time.perf_counter() - started)
+        if self.kind == "video":
+            self.marks[self.index - 1] = tuple(Mark(entry.track.track_id, entry.box, entry.track.color, entry.contours,
+                                                    entry.shape) for entry in self.entries)
+        rate = 1 / max(1e-3, time.perf_counter() - started)
+        self.rate = rate if not self.rate else self.rate + RATE_SMOOTHING * (rate - self.rate)
         self.show()
 
     def measure(self) -> None:
         """Add one measurement of the current frame to every animal that can be measured in it."""
         scene = self.scene
-        factor, self.scale_source = 1., scene.source
-        if self.reference is not None:
-            segment, true_length = self.reference
-            seen = segment_length(scene.points, segment)
-            if seen and FACTOR_LIMITS[0] <= true_length / seen <= FACTOR_LIMITS[1]:
-                factor, self.scale_source = true_length / seen, SEGMENT
-            else:
-                self.scale_source = SEGMENT_FAILED
         for entry in self.entries:
-            track, _, mask, shape, blocked, _ = entry
-            if blocked:
-                entry[5] = blocked
-            elif shape is None:
-                entry[5] = NO_OUTLINE
+            if entry.blocked:
+                entry.note = entry.blocked
+            elif entry.shape is None:
+                entry.note = NO_OUTLINE
             else:
-                sample, entry[5] = measure_pig(shape, scene.points, mask, scene.focal, scene.floor)
+                sample, entry.note = measure_pig(entry.shape, scene.points, entry.mask, scene.focal, scene.floor)
                 if sample is not None:
-                    track.accumulator.add(sample, factor)
+                    entry.track.accumulator.add(sample)
+            self.notes[entry.track.track_id] = entry.note
+
+    def scale(self) -> tuple:
+        """(length factor, where the scale comes from, the animal weighed on scales if it set the scale)."""
+        factor, source = 1., self.frame_source
+        if self.reference is not None and self.segment_factor is not None:
+            factor, source = (self.segment_factor, SEGMENT) if self.segment_factor else (1., SEGMENT_FAILED)
+        if self.known is not None:
+            track_id, mass = self.known
+            track = self.seen.get(track_id)
+            weighed = track.accumulator.estimate() if track is not None else None
+            if weighed is None or weighed.mass_kg <= 0:
+                return factor, WEIGHT_FAILED, None
+            return float((mass / weighed.mass_kg) ** (1 / 3)), WEIGHT, track_id
+        return factor, source, None
+
+    def estimates(self) -> tuple:
+        """Every animal seen, at the current scale: ({number: estimate or None}, scale source, factor, weighed one)."""
+        factor, source, weighed = self.scale()
+        found = {}
+        for key, track in self.seen.items():
+            estimate = track.accumulator.estimate(source in CALIBRATED)
+            found[key] = None if estimate is None else estimate.scaled(factor)
+        return found, source, factor, weighed
 
     def show(self) -> None:
         """Publish the last analysed frame with what is known about every animal in it."""
-        calibrated = self.scale_source in (SEGMENT, STEREO)
-        pigs = tuple(PigView(track.track_id, box, track.color, mask, shape, track.accumulator.estimate(calibrated), note)
-                     for track, box, mask, shape, _, note in self.entries)
+        estimates, source, factor, weighed = self.estimates()
+        pigs = tuple(PigView(entry.track.track_id, entry.box, entry.track.color, entry.contours, entry.shape,
+                             estimates.get(entry.track.track_id), entry.note) for entry in self.entries)
+        in_view = {pig.track_id for pig in pigs}
+        animals = tuple(PigRow(key, estimate, WEIGHED if key == weighed else self.notes.get(key, ""), key in in_view)
+                        for key, estimate in estimates.items())
+        measured = sum(estimate is not None for estimate in estimates.values())
+        video = self.kind == "video"
         if self.scene is None:
             message = self.state.message
+        elif video and self.finished:
+            message = f"Видео обработано целиком, кадров: {self.frames}. Взвешено свиней: {measured}."
+        elif video:
+            message = f"Обрабатываю видео: кадр {self.index} из {max(self.frames, self.index)}."
         elif not pigs:
             message = "Свиней на кадре не найдено."
         else:
-            measured = sum(pig.estimate is not None for pig in pigs)
-            message = f"Найдено свиней: {len(pigs)}, измерено: {measured}."
-        if self.scene is not None and self.finished:
-            message += " Видео закончилось."
-        video = self.kind == "video"
-        self.publish(image=None if self.scene is None else self.scene.image, pigs=pigs, message=message, kind=self.kind,
-                     playing=self.playing, finished=self.finished, position_s=self.index / self.fps if video else 0.,
-                     duration_s=self.frames / self.fps if video else 0., scale_source=self.scale_source,
-                     fps=self.rate if self.kind in ("video", "camera") else 0.)
+            message = f"Найдено свиней: {len(pigs)}, измерено: {sum(pig.estimate is not None for pig in pigs)}."
+        floor = None if self.scene is None else self.scene.floor
+        self.publish(image=None if self.scene is None else self.scene.image, pigs=pigs, animals=animals, message=message,
+                     kind=self.kind, playing=self.playing, finished=self.finished,
+                     position_s=self.index / self.fps if video else 0., duration_s=self.frames / self.fps if video else 0.,
+                     frame=self.index if video else 0, frames=self.frames if video else 0, scale_source=source,
+                     camera_height_m=None if floor is None else floor.offset * factor, weighed_pig=weighed,
+                     fps=self.rate if self.kind in ("video", "camera") else 0., video_file=self.video_file,
+                     rendering=None if self.render is None else self.state.rendering or 0.)
+
+    # The marked-up video.
+    def start_render(self) -> None:
+        """Write the video again, every frame marked, with the weights as they are now."""
+        self.stop_render()
+        if self.kind == "video" and self.finished and self.marks and self.path is not None and self.output is not None:
+            self.render = self.render_frames()
+            self.state = replace(self.state, rendering=0.)
+
+    def stop_render(self) -> None:
+        if self.render is not None:
+            self.render.close()
+            self.render = None
+
+    def render_step(self) -> None:
+        try:
+            done = next(self.render)
+        except StopIteration as finished:
+            self.render = None
+            self.video_file = str(finished.value or "")
+            self.show()
+        except Exception as error:  # noqa: BLE001 - a full disk must not end the session.
+            self.stop_render()
+            self.publish(rendering=None, message=f"Не удалось записать видео с разметкой: {error}")
+        else:
+            self.publish(rendering=min(1., done / max(1, self.frames)))
+
+    def render_frames(self):
+        """A generator that writes a batch of frames each time it is advanced and returns the file."""
+        estimates, source, _, _ = self.estimates()
+        texts = {key: label_text(key, estimate) for key, estimate in estimates.items()}
+        folder = result_folder(self.output)
+        target = folder / f"{self.path.stem}{MARKED_SUFFIX}.mp4"
+        capture = cv2.VideoCapture(str(self.path))
+        writer = written = None
+        complete = False
+        try:
+            index = 0
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if writer is None:
+                    folder.mkdir(parents=True, exist_ok=True)
+                    writer, written = open_writer(target, self.fps, frame.shape[1], frame.shape[0])
+                marks = self.marks.get(index, ())
+                draw_marks(frame, marks, [texts.get(mark.track_id, f"#{mark.track_id}") for mark in marks], self.shrink)
+                writer.write(frame)
+                index += 1
+                if index % RENDER_BATCH == 0:
+                    yield index
+            complete = writer is not None
+        finally:
+            capture.release()
+            if writer is not None:
+                writer.release()
+            if not complete and written is not None:
+                Path(written).unlink(missing_ok=True)
+        if written != target:
+            shutil.move(str(written), str(target))
+        from .version import VERSION
+        rows = [PigRow(key, estimate, "", False) for key, estimate in estimates.items()]
+        write_result(folder / "result.json", rows, dict(version=VERSION, source="video", scale=source,
+                                                        video=self.path.name, frames=index))
+        return target
