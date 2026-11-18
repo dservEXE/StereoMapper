@@ -36,7 +36,7 @@ function Open-TrustedResponse([string]$Url) {
         $request.AllowAutoRedirect = $false
         $request.Timeout = 30000
         $request.ReadWriteTimeout = 30000
-        $request.UserAgent = 'StereoMapper-Installer/0.16.5'
+        $request.UserAgent = 'StereoMapper-Installer/0.16.6'
         $request.Accept = 'application/vnd.github+json'
         $response = $request.GetResponse()
         if ([int]$response.StatusCode -in @(301,302,303,307,308)) {
