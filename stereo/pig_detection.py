@@ -4,6 +4,7 @@ D-FINE trained on Objects365 knows pigs, which the people detector does not. Sli
 the people tab, traces every found animal from one pass over the picture. Depth Anything gives
 metres from the camera for every pixel of an ordinary photograph. All are downloaded on request.
 """
+from contextlib import nullcontext
 import os
 from types import SimpleNamespace
 
@@ -35,6 +36,10 @@ SAME_ANIMAL_SHARE = .6
 MERGED_PART_SHARE = .2
 MIN_OWN_SHARE = .5
 TRIAL_SIZE = 256
+# Frames analysed at once. Measured on a 4-core processor: two at a time with half the cores
+# each gave 17% more frames than one with all of them, as each frame also has steps that use one
+# core. With a card, one frame is computed there while the processor prepares the other.
+WORKERS = 2
 # D-FINE samples the picture the way RT-DETR does, which kills the whole process on DirectML.
 DIRECTML_UNSAFE = ("detector",)
 
@@ -106,8 +111,13 @@ class PigDetector:
                                   RTDetrImageProcessor, SamImageProcessor, SamModel, SamProcessor)
         self.torch = torch
         self.device, self.device_name = select_device(torch)
-        # On CUDA the processor only prepares data. Otherwise it does the real work.
-        torch.set_num_threads(2 if self.device == "cuda" else max(2, (os.cpu_count() or 4) - 2))
+        # Every core works while the tab is open; the rest of the program waits meanwhile.
+        cores = os.cpu_count() or 4
+        torch.set_num_threads(max(1, cores // WORKERS))
+        cv2.setNumThreads(cores)
+        self.half = False
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = True
         options = dict(local_files_only=True)
         status("Загружаю модели поиска свиней…")
         detector, segmenter, depth = (model_path(root, source) for source in SOURCES)
@@ -130,6 +140,7 @@ class PigDetector:
         """Try every model on the card with a blank picture; a failing or slower one stays on the processor."""
         blank = np.zeros((TRIAL_SIZE, TRIAL_SIZE, 3), np.uint8)
         box = np.array([[TRIAL_SIZE * .25, TRIAL_SIZE * .25, TRIAL_SIZE * .75, TRIAL_SIZE * .75]], np.float32)
+        self.half = False
         trials = (("detector", self.detector, lambda: self.detect(blank)),
                   ("outline", self.segmenter, lambda: self.outlines(blank, box)),
                   ("depth", self.depth_model, lambda: self.depth(blank)))
@@ -148,6 +159,22 @@ class PigDetector:
             except Exception:  # noqa: BLE001 - backends raise anything for an unsupported operator.
                 self.devices[name] = "cpu"
                 model.to("cpu")
+        if self.device == "cuda" and self.on_card:
+            # Half precision is about twice as fast on NVIDIA cards made for it; kept only if every model takes it.
+            self.half = True
+            try:
+                for _, _, trial in trials:
+                    trial()
+                if not np.isfinite(self.depth(blank)).all():
+                    raise RuntimeError("half precision lost the distances")
+            except Exception:  # noqa: BLE001 - an older card may lack half-precision operators.
+                self.half = False
+
+    def precision(self, name):
+        """Half precision on an NVIDIA card where it was checked to work, full precision elsewhere."""
+        if self.half and self.devices[name] == "cuda":
+            return self.torch.autocast("cuda", dtype=self.torch.float16)
+        return nullcontext()
 
     @property
     def on_card(self) -> list:
@@ -160,17 +187,19 @@ class PigDetector:
             return "процессор"
         if not self.on_card:
             return f"процессор ({self.device_name} не подошла)"
-        return self.device_name + ("" if len(self.on_card) == len(self.devices) else " и процессор")
+        label = self.device_name + ("" if len(self.on_card) == len(self.devices) else " и процессор")
+        return label + (", половинная точность" if self.half else "")
 
     def detect(self, bgr) -> tuple:
         """Boxes (x0, y0, x1, y1) and scores of the animals, best first."""
         torch = self.torch
         image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        with torch.no_grad():
+        with torch.no_grad(), self.precision("detector"):
             inputs = self.detector_processor(images=image, return_tensors="pt").to(self.devices["detector"])
             output = self.detector(**inputs)
+        with torch.no_grad():
             found = self.detector_processor.post_process_object_detection(
-                SimpleNamespace(logits=output.logits.cpu(), pred_boxes=output.pred_boxes.cpu()),
+                SimpleNamespace(logits=output.logits.float().cpu(), pred_boxes=output.pred_boxes.float().cpu()),
                 target_sizes=torch.tensor([bgr.shape[:2]]), threshold=min(self.thresholds.values()))[0]
         boxes, scores, labels = (found[key].numpy() for key in ("boxes", "scores", "labels"))
         wanted = np.array([score >= self.thresholds.get(int(label), 2.) for score, label in zip(scores, labels)], bool)
@@ -189,22 +218,25 @@ class PigDetector:
                                       return_tensors="pt")
         device = self.devices["outline"]
         # The processor gives 64-bit coordinates, which DirectML does not have.
-        with torch.no_grad():
+        with torch.no_grad(), self.precision("outline"):
             embedding = self.segmenter.get_image_embeddings(inputs["pixel_values"].to(device, torch.float32))
             output = self.segmenter(image_embeddings=embedding,
                                     input_boxes=inputs["input_boxes"].to(device, torch.float32),
                                     multimask_output=False)
-        masks = self.segment_images.post_process_masks(output.pred_masks.cpu(), inputs["original_sizes"],
-                                                       inputs["reshaped_input_sizes"])[0]
-        return [fill_holes(mask[0].numpy().astype(bool)) for mask in masks]
+        # Enlarging the small masks to the frame is heavy work; on an NVIDIA card it is done there.
+        low = output.pred_masks.float() if device == "cuda" else output.pred_masks.float().cpu()
+        with torch.no_grad():
+            masks = self.segment_images.post_process_masks(low, inputs["original_sizes"], inputs["reshaped_input_sizes"])[0]
+        return [fill_holes(mask[0].cpu().numpy().astype(bool)) for mask in masks]
 
     def depth(self, bgr) -> np.ndarray:
         """Estimated metres from the camera for every pixel of an ordinary picture."""
         torch = self.torch
         image = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        with torch.no_grad():
+        with torch.no_grad(), self.precision("depth"):
             inputs = self.depth_processor(images=image, return_tensors="pt").to(self.devices["depth"])
             predicted = self.depth_model(**inputs).predicted_depth
+        with torch.no_grad():
             full = torch.nn.functional.interpolate(predicted.unsqueeze(1).float(), size=bgr.shape[:2], mode="bilinear",
                                                    align_corners=False)[0, 0]
         return full.cpu().numpy().astype(np.float32)

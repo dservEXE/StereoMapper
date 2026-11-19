@@ -1,10 +1,14 @@
 """Size and weight of a pig from its outline and the position in space of every pixel in it.
 
 The outline gives the shape in the picture: where the head, the neck and the rump are, how thick
-the body is behind the shoulders. The positions turn that into metres, each part at its own
+the body is along its whole length. The positions turn that into metres, each part at its own
 distance from the camera, and tell from which side the body is seen, so no view has to be chosen.
-The weight is the farm tape formula: heart girth squared times body length. A camera sees one
-thickness of the body; the other is assumed from it.
+
+The weight is found as for people: the body from the snout to the rump is cut into slices across
+it, each an ellipse of the width and the depth of the body there, so a narrow head, a deep belly
+and broad hams each count at their own place. The volume times the density of the body is the
+mass. A camera sees one thickness of the body; the other is assumed from it. Length and heart
+girth, the farm tape measurements, are kept as well, for comparison with a tape.
 """
 from typing import NamedTuple
 
@@ -35,6 +39,12 @@ SURFACE_WINDOW = .12
 DEPTH_TO_WIDTH = 1.2
 # Weight, kg = heart girth, m, squared x length from ears to tail root, m x 69.3
 TAPE_FACTOR = 69.3
+SLICES = 24
+# Not measured on pigs: lean tissue is about 1.06 kg/l and fat about 0.92, and carcass density is
+# known to follow the fat content; a live body also holds air. The pig database corrects the rest.
+BODY_DENSITY_KG_M3 = 1030.
+# The legs below the belly are cut away with the other thin parts and are not measured; assumed.
+LEGS_FACTOR = 1.05
 MIN_STRAIGHTNESS = .96
 LENGTH_TO_WIDTH = (1.7, 5.5)
 # Beyond this the body points at the camera and its length is mostly hidden.
@@ -48,7 +58,11 @@ NO_DEPTH = "расстояние не определено"
 
 
 class PigShape(NamedTuple):
-    """One outline measured in pixels; points are (x, y) in the image."""
+    """One outline measured in pixels; points are (x, y) in the image.
+
+    slices are the thickness of the body across it, from the snout to the rump, and slice_points
+    where each is taken, on the body line.
+    """
     length_px: float
     full_length_px: float
     girth_px: float
@@ -58,6 +72,8 @@ class PigShape(NamedTuple):
     rump: tuple
     spine: tuple
     girth_point: tuple
+    slices: tuple = ()
+    slice_points: tuple = ()
 
 
 class PigSample(NamedTuple):
@@ -66,6 +82,14 @@ class PigSample(NamedTuple):
     girth_m: float
     thickness_m: float
     side_share: float
+    volume_m3: float | None = None
+
+    @property
+    def mass_kg(self) -> float:
+        """From the volume when the slices are known, else by the tape formula."""
+        if self.volume_m3:
+            return self.volume_m3 * BODY_DENSITY_KG_M3 * LEGS_FACTOR
+        return tape_mass(self.length_m, self.girth_m)
 
 
 class PigEstimate(NamedTuple):
@@ -75,12 +99,13 @@ class PigEstimate(NamedTuple):
     mass_low_kg: float
     mass_high_kg: float
     samples: int
+    volume_l: float | None = None
 
     def scaled(self, factor) -> "PigEstimate":
         """The same animal with every size `factor` times larger, so the weight is its cube times heavier."""
         cube = factor ** 3
         return PigEstimate(self.length_m * factor, self.girth_m * factor, self.mass_kg * cube, self.mass_low_kg * cube,
-                           self.mass_high_kg * cube, self.samples)
+                           self.mass_high_kg * cube, self.samples, None if self.volume_l is None else self.volume_l * cube)
 
 
 def largest_part(mask) -> np.ndarray:
@@ -158,6 +183,8 @@ def pig_shape(mask) -> PigShape | None:
     zone = profile[neck + int(trunk_count * GIRTH_ZONE[0]):neck + max(int(trunk_count * GIRTH_ZONE[1]), int(trunk_count * GIRTH_ZONE[0]) + 1)]
     full_length = float(steps.sum())
     chord = float(np.hypot(end, spine[-1] - spine[0]))
+    bounds = np.linspace(0, end + 1, SLICES + 1)
+    parts = [profile[int(bounds[index]):max(int(bounds[index]) + 1, int(bounds[index + 1]))] for index in range(SLICES)]
 
     def point(index) -> tuple:
         index = int(round(index))
@@ -167,7 +194,9 @@ def pig_shape(mask) -> PigShape | None:
     return PigShape(float(steps[neck:].sum()), full_length, float(np.median(zone)),
                     chord / full_length if full_length else 0., point(0), point(neck), point(end),
                     tuple(point(neck + fraction * trunk_count) for fraction in SPINE_FRACTIONS),
-                    point(neck + trunk_count * sum(GIRTH_ZONE) / 2))
+                    point(neck + trunk_count * sum(GIRTH_ZONE) / 2),
+                    tuple(float(np.median(part)) for part in parts),
+                    tuple(point(min(end, (bounds[index] + bounds[index + 1]) / 2)) for index in range(SLICES)))
 
 
 def ellipse_perimeter(width, depth) -> float:
@@ -204,11 +233,33 @@ def measure_pig(shape, points, mask, focal, floor=None) -> tuple:
     chest = surface_point(points, *shape.girth_point, radius, mask)
     thickness = shape.girth_px * float(centre[2] if chest is None else chest[2]) / focal
     side_share = seen_from_side(axis, view, CAMERA_UP if floor is None else floor.normal)
-    width = thickness / float(np.sqrt(DEPTH_TO_WIDTH ** 2 * side_share + 1 - side_share))
+    width = width_of(thickness, side_share)
     # Compared by width, so that the deeper body seen from the side passes the same test as from above.
     if not width or not LENGTH_TO_WIDTH[0] <= length / width <= LENGTH_TO_WIDTH[1]:
         return None, BAD_POSE
-    return PigSample(length, ellipse_perimeter(width, width * DEPTH_TO_WIDTH), thickness, side_share), ""
+    volume = slices_volume(shape, points, mask, focal, length / shape.length_px, side_share, float(centre[2]), radius)
+    return PigSample(length, ellipse_perimeter(width, width * DEPTH_TO_WIDTH), thickness, side_share, volume), ""
+
+
+def width_of(thickness, side_share) -> float:
+    """The width of the body from the thickness seen, by how much of the side is seen."""
+    return thickness / float(np.sqrt(DEPTH_TO_WIDTH ** 2 * side_share + 1 - side_share))
+
+
+def slices_volume(shape, points, mask, focal, metres_per_pixel, side_share, distance, radius) -> float | None:
+    """Sum of elliptic slices from the snout to the rump, each at its own distance from the camera.
+
+    metres_per_pixel is along the body, so an animal standing at an angle is not shortened.
+    """
+    if not shape.slices:
+        return None
+    step = shape.full_length_px / len(shape.slices) * metres_per_pixel
+    volume = 0.
+    for thickness_px, (x, y) in zip(shape.slices, shape.slice_points):
+        spot = surface_point(points, x, y, radius, mask)
+        width = width_of(thickness_px * (distance if spot is None else float(spot[2])) / focal, side_share)
+        volume += np.pi / 4 * width * width * DEPTH_TO_WIDTH * step
+    return float(volume)
 
 
 def seen_from_side(axis, view, up) -> float:
@@ -229,16 +280,19 @@ class PigAccumulator:
         self.samples = []
 
     def add(self, sample, factor=1.) -> None:
-        self.samples = [*self.samples[-(MAX_SAMPLES - 1):], (sample.length_m * factor, sample.girth_m * factor)]
+        volume = None if sample.volume_m3 is None else sample.volume_m3 * factor ** 3
+        self.samples = [*self.samples[-(MAX_SAMPLES - 1):],
+                        (sample.length_m * factor, sample.girth_m * factor, sample.mass_kg * factor ** 3, volume)]
 
     def estimate(self, calibrated=True) -> PigEstimate | None:
         if not self.samples:
             return None
-        lengths, girths = (np.array(values) for values in zip(*self.samples))
-        length, girth = float(np.median(lengths)), float(np.median(girths))
-        mass = tape_mass(length, girth)
-        each = TAPE_FACTOR * girths * girths * lengths
+        lengths, girths, masses, volumes = zip(*self.samples)
+        each = np.array(masses)
+        mass = float(np.median(each))
+        known = [volume for volume in volumes if volume is not None]
         spread = FORMULA_SPREAD if calibrated else UNCALIBRATED_SPREAD
         low = min(float(np.percentile(each, 25)), mass * (1 - spread))
         high = max(float(np.percentile(each, 75)), mass * (1 + spread))
-        return PigEstimate(length, girth, mass, low, high, len(self.samples))
+        return PigEstimate(float(np.median(lengths)), float(np.median(girths)), mass, low, high, len(self.samples),
+                           float(np.median(known)) * 1000 if known else None)

@@ -1,4 +1,5 @@
 """The pig weighing tab: photographs, video files and the connected camera, analysed only while the tab is open."""
+from datetime import datetime
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -10,9 +11,10 @@ import cv2
 
 from .gpu_pack import installed_pack
 from .people_detection import download_models, models_ready
+from .pig_database import PigDatabase, correction, export_csv, make_entry, summary_text
 from .pig_detection import SOURCES, missing_size_mb
 from .pig_drawing import draw_marks, kg_text, label_text
-from .pig_weighing import (PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED, WEIGHT, WEIGHT_FAILED, PigSession,
+from .pig_weighing import (LEARNED, PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED, WEIGHT, WEIGHT_FAILED, PigSession,
                            result_folder, write_result)
 from .ui import note
 from .version import VERSION
@@ -21,8 +23,9 @@ NO_VALUE = "—"
 SEGMENT_COLOR = (60, 220, 255)
 PHOTO_TYPES = [("Фото", "*.jpg *.jpeg *.png *.bmp *.webp"), ("Все файлы", "*.*")]
 VIDEO_TYPES = [("Видео", "*.mp4 *.avi *.mov *.mkv *.m4v *.wmv"), ("Все файлы", "*.*")]
-COLUMNS = (("pig", "№", 46), ("mass", "Вес, кг", 80), ("range", "Диапазон, кг", 110), ("length", "Длина, см", 90),
-           ("girth", "Обхват груди, см", 130), ("frames", "Кадров", 70), ("note", "Примечание", 300))
+COLUMNS = (("pig", "№", 46), ("mass", "Вес, кг", 80), ("range", "Диапазон, кг", 110), ("volume", "Объём, л", 80),
+           ("length", "Длина, см", 90), ("girth", "Обхват груди, см", 130), ("frames", "Кадров", 70),
+           ("note", "Примечание", 280))
 TABLE_ROWS = 5
 WRAP = 280
 SCALE_TEXTS = {
@@ -33,6 +36,8 @@ SCALE_TEXTS = {
     SEGMENT_FAILED: "Отрезок измерить не удалось. Отметьте его на неподвижном, хорошо видном предмете.",
     WEIGHT: "Масштаб уточнён по весу свиньи №{pig}: остальные пересчитаны по ней.",
     WEIGHT_FAILED: "Свинья с этим номером ещё не измерена, по ней масштаб не уточнить. Выберите номер с весом из таблицы.",
+    LEARNED: "Масштаб поправлен по базе: взвешенных свиней {learned}. Для другого места или камеры поправка может не "
+             "подойти: тогда взвесьте здесь одну свинью.",
 }
 NO_CAMERA = "Сначала подключите камеры на вкладке «1 Камеры»."
 ACCELERATION = "комплект на вкладке «Дополнительно»"
@@ -63,15 +68,16 @@ def pig_row(pig) -> tuple:
     """One table line: number, weight, range, length, girth, frames, and why a value is missing."""
     estimate = pig.estimate
     if estimate is None:
-        return (pig.track_id, *(NO_VALUE,) * 4, 0, pig.note)
+        return (pig.track_id, *(NO_VALUE,) * 5, 0, pig.note)
     if pig.note == WEIGHED:
         remark = WEIGHED
     elif pig.note and getattr(pig, "in_view", True):
         remark = f"этот кадр пропущен: {pig.note}"
     else:
         remark = ""
+    volume = NO_VALUE if estimate.volume_l is None else kg_text(estimate.volume_l)
     return (pig.track_id, kg_text(estimate.mass_kg), f"{kg_text(estimate.mass_low_kg)}–{kg_text(estimate.mass_high_kg)}",
-            f"{estimate.length_m * 100:.0f}", f"{estimate.girth_m * 100:.0f}", estimate.samples, remark)
+            volume, f"{estimate.length_m * 100:.0f}", f"{estimate.girth_m * 100:.0f}", estimate.samples, remark)
 
 
 def time_text(seconds) -> str:
@@ -80,7 +86,7 @@ def time_text(seconds) -> str:
 
 def scale_text(state) -> str:
     height = "" if state.camera_height_m is None else f": по нему камера в {state.camera_height_m * 100:.0f} см над полом"
-    return SCALE_TEXTS[state.scale_source].format(height=height, pig=state.weighed_pig)
+    return SCALE_TEXTS[state.scale_source].format(height=height, pig=state.weighed_pig, learned=state.learned_pigs)
 
 
 def device_text(device, pack) -> str:
@@ -95,7 +101,7 @@ def device_text(device, pack) -> str:
 
 
 def progress_text(state) -> str:
-    """How far the video is, how fast it goes and how long is left."""
+    """How fast the video goes against its own rate, how fast the networks look, and how long is left."""
     if state.rendering is not None:
         return f" Записываю видео с разметкой: {state.rendering * 100:.0f} %."
     if state.kind == "camera" and state.fps:
@@ -103,7 +109,8 @@ def progress_text(state) -> str:
     if state.kind != "video" or state.finished or not state.playing or not state.fps:
         return ""
     left = max(0, state.frames - state.frame) / state.fps
-    return f" {state.fps:.1f} кадра/с, осталось около {time_text(left)}."
+    networks = f", нейросети {state.analysis_fps:.1f} кадра/с" if state.analysis_fps else ""
+    return f" Показ {state.fps:.0f} из {state.video_fps:.0f} кадров/с{networks}, осталось около {time_text(left)}."
 
 
 class PigTab:
@@ -130,6 +137,9 @@ class PigTab:
         self.known_pig = tk.StringVar()
         self.known_mass = tk.StringVar()
         self.sent_known = None
+        self.database = PigDatabase(app.directory)
+        self.database_text = tk.StringVar()
+        self.sent_learned = None
         # A new pack starts working only after a restart, so this cannot change while the tab is open.
         self.pack = installed_pack(app.directory)
         heading(sidebar, "Взвесим свиней", "Откройте фото или видео или включите камеру. Программа сама оценит "
@@ -162,6 +172,16 @@ class PigTab:
         ttk.Entry(known, textvariable=self.known_pig, width=8).grid(row=0, column=1, sticky="e", pady=2)
         ttk.Label(known, text="Её вес на весах, кг").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Entry(known, textvariable=self.known_mass, width=8).grid(row=1, column=1, sticky="e", pady=2)
+        database = ttk.Frame(sidebar)
+        database.pack(fill="x", pady=(4, 0))
+        database.columnconfigure((0, 1), weight=1, uniform="database")
+        self.add_button = ttk.Button(database, text="Добавить в базу", command=self.add_to_database)
+        self.add_button.grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
+        self.undo_button = ttk.Button(database, text="Убрать запись", command=self.remove_last)
+        self.undo_button.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        self.export_button = ttk.Button(database, text="Сохранить базу в CSV", command=self.export_database)
+        self.export_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(sidebar, textvariable=self.database_text, style="Muted.TLabel", wraplength=WRAP, justify="left").pack(anchor="w", fill="x", pady=(2, 6))
         note(sidebar, "Или отметьте на кадре отрезок, длину которого знаете: ширину кормушки, станка или линейку.")
         self.mark_button = action(sidebar, "Отметить отрезок на кадре", self.start_marking)
         form = ttk.Frame(sidebar)
@@ -253,6 +273,7 @@ class PigTab:
             self.sent_reference = self.sent_known = None
             self.apply_reference()
             self.apply_known()
+            self.apply_learned()
         if self.session is not None and selected != self.active:
             self.session.set_active(selected)
         self.active = selected
@@ -381,6 +402,59 @@ class PigTab:
         if self.session is not None and reference != self.sent_reference:
             self.sent_reference = reference
             self.session.post("reference", reference)
+
+    # The pig database.
+    def apply_learned(self) -> None:
+        """Tell the session how the pictures of earlier videos were corrected, and show what the base holds."""
+        try:
+            entries = self.database.entries()
+        except Exception as error:  # noqa: BLE001 - a damaged base must not stop the weighing.
+            self.database_text.set(f"Базу свиней не прочитать: {error}")
+            return
+        self.database_text.set(summary_text(entries, PICTURE))
+        learned = correction(entries, PICTURE)
+        if self.session is not None:
+            self.sent_learned = learned
+            self.session.post("learned", learned)
+
+    def add_to_database(self) -> None:
+        known = self.known()
+        if known is None or self.state is None:
+            self.message.set("Введите номер свиньи с кадра и её вес с весов, затем добавьте в базу.")
+            return
+        row = next((pig for pig in self.state.animals if pig.track_id == known[0]), None)
+        source = self.state.kind or ""
+        try:
+            entry = make_entry(row, str(known[1]), f"№{known[0]}", source, VERSION)
+            self.database.add(entry)
+        except Exception as error:  # noqa: BLE001 - every failure is told, none is fatal.
+            self.message.set(str(error))
+            return
+        self.message.set(f"Свинья №{known[0]} добавлена в базу: {kg_text(entry.real_weight_kg)} кг на весах, "
+                         f"{kg_text(entry.estimated_weight_kg)} кг по снимку без поправки.")
+        self.apply_learned()
+
+    def remove_last(self) -> None:
+        try:
+            entries = self.database.entries()
+            if not entries:
+                self.message.set("База свиней пуста.")
+                return
+            self.database.delete(entries[0].id)
+        except Exception as error:  # noqa: BLE001 - every failure is told, none is fatal.
+            self.message.set(f"Не удалось изменить базу: {error}")
+            return
+        self.message.set(f"Из базы убрана запись {entries[0].label or entries[0].id}.")
+        self.apply_learned()
+
+    def export_database(self) -> None:
+        path = self.app.directory / "output" / f"pigs_database_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            count = export_csv(self.database.entries(), path)
+        except Exception as error:  # noqa: BLE001 - every failure is told, none is fatal.
+            self.message.set(f"Не удалось сохранить базу: {error}")
+            return
+        self.message.set(f"Записей в CSV: {count}. Файл {self.shown_path(path)}.")
 
     def known(self) -> tuple | None:
         """(number, kilograms) of the animal weighed on scales, once both are typed."""
