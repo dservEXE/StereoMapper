@@ -18,16 +18,19 @@ from stereo.app import StereoApp
 from stereo.calibration import latest_calibration
 from stereo.camera import CameraConfig
 from stereo.people_detection import SEGMENTER, WEIGHTS_FILE, model_path
+from stereo.pig_database import PigDatabase, correction, export_csv, make_entry, summary_text
 from stereo.pig_detection import DEPTH, DETECTOR, PigDetector, distinct_outlines, keep_distinct, missing_size_mb
 from stereo.pig_drawing import draw_marks, girth_line, kg_text, label_text, outline_contours
-from stereo.pig_measure import (BAD_POSE, DEPTH_TO_WIDTH, END_ON, NO_DEPTH, PigAccumulator, PigEstimate, PigSample,
-                                ellipse_perimeter, measure_pig, pig_shape, seen_from_side, tape_mass)
+from stereo.pig_measure import (BAD_POSE, BODY_DENSITY_KG_M3, DEPTH_TO_WIDTH, END_ON, LEGS_FACTOR, NO_DEPTH,
+                                PigAccumulator, PigEstimate, PigSample, ellipse_perimeter, measure_pig, pig_shape,
+                                seen_from_side, tape_mass)
 from stereo.pig_scene import (CAMERA_UP, Floor, assumed_focal, fit_floor, floor_candidates, hidden_behind, scene_points,
                               segment_length, stereo_scale)
 from stereo.pig_ui import NO_CAMERA, device_text, draw_pigs, parse_number, pig_row, progress_text, scale_text
-from stereo.pig_weighing import (CUT, MARKED_SUFFIX, MEMORY_S, PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED, WEIGHT,
-                                 WEIGHT_FAILED, PigSession, PigState, PigTracker, fitted, read_image, reading_order,
-                                 write_result)
+from stereo.pig_tracking import IDENTITY, carried, compose, follow, follower, moved_shape, tracking_gray
+from stereo.pig_weighing import (CUT, LEARNED, MARKED_SUFFIX, MEMORY_S, PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED,
+                                 WEIGHT, WEIGHT_FAILED, PigRow, PigSession, PigState, PigTracker, fitted, read_image,
+                                 reading_order, write_result)
 from stereo.worker import CameraWorker
 
 SIZE = 700
@@ -390,6 +393,16 @@ class FakeDetector:
         return np.where(image[:, :, 0] > 127, FAKE_BACK, FAKE_FLOOR).astype(np.float32)
 
 
+def textured(mask, shift=0) -> np.ndarray:
+    """A pig with spots on its skin that move with it, so that its motion can be followed."""
+    rng = np.random.default_rng(7)
+    skin = cv2.GaussianBlur(rng.integers(150, 256, (SIZE, SIZE + 200), dtype=np.uint8), (5, 5), 0)
+    skin = np.clip(skin.astype(int) * 2 - 200, 140, 255).astype(np.uint8)[:, 200 - shift:200 - shift + SIZE]
+    image = np.zeros((SIZE, SIZE, 3), np.uint8)
+    image[mask] = skin[mask][:, None]
+    return image
+
+
 def picture(*masks) -> np.ndarray:
     image = np.zeros((SIZE, SIZE, 3), np.uint8)
     for mask in masks:
@@ -557,7 +570,8 @@ class SessionTests(unittest.TestCase):
         saved = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(saved["source"], "photo")
         self.assertEqual(set(saved["pigs"][0]), {"label", "mass_kg", "mass_low_kg", "mass_high_kg", "length_m", "girth_m",
-                                                  "samples"})
+                                                  "samples", "volume_l"})
+        self.assertGreater(saved["pigs"][0]["volume_l"], 0)
         self.assertEqual([path.name for path in target.parent.iterdir()], ["result.json"])
 
 
@@ -656,9 +670,12 @@ class TabTextTests(unittest.TestCase):
         estimate = accumulator.estimate()
         row = pig_row(SimpleNamespace(track_id=3, estimate=estimate, note=""))
         self.assertEqual(row[:2], (3, f"{estimate.mass_kg:.0f}"))
-        self.assertEqual(row[3:], ("112", "120", 1, ""))
-        self.assertIn(BAD_POSE, pig_row(SimpleNamespace(track_id=3, estimate=estimate, note=BAD_POSE))[6])
-        self.assertEqual(pig_row(SimpleNamespace(track_id=4, estimate=None, note=CUT)), (4, "—", "—", "—", "—", 0, CUT))
+        self.assertEqual(row[3:], ("—", "112", "120", 1, ""))
+        self.assertIn(BAD_POSE, pig_row(SimpleNamespace(track_id=3, estimate=estimate, note=BAD_POSE))[7])
+        self.assertEqual(pig_row(SimpleNamespace(track_id=4, estimate=None, note=CUT)), (4, "—", "—", "—", "—", "—", 0, CUT))
+        with_volume = PigAccumulator()
+        with_volume.add(PigSample(1.12, 1.2, .36, 0., .095))
+        self.assertEqual(pig_row(SimpleNamespace(track_id=3, estimate=with_volume.estimate(), note=""))[3], "95")
 
     def test_drawing_marks_animals_and_the_segment_without_touching_the_frame(self):
         mask = pig_mask()
@@ -917,9 +934,9 @@ class CalibrationAndVideoTests(SessionTests):
         self.session.post("known", None)
         self.wait(lambda state: state.scale_source == PICTURE)
 
-    def test_every_frame_of_a_video_is_analysed_and_written_again_marked(self):
+    def test_every_frame_of_a_video_is_shown_and_written_again_marked_where_the_pig_is(self):
         side = 1400
-        frames = [cv2.resize(picture(pig_mask(centre=(250 + 4 * step, 350), scale=.8)), (side, side),
+        frames = [cv2.resize(textured(pig_mask(centre=(250 + 4 * step, 350), scale=.8), 4 * step), (side, side),
                              interpolation=cv2.INTER_NEAREST) for step in range(30)]
         path = write_video(Path(self.temp.name) / "свиньи.avi", [])
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 20., (side, side))
@@ -929,7 +946,8 @@ class CalibrationAndVideoTests(SessionTests):
         self.session.post("video", path)
         state = self.wait(lambda state: state.finished and state.video_file and state.rendering is None, timeout=30)
         self.assertEqual((state.frame, state.frames), (30, 30))
-        self.assertEqual(state.animals[0].estimate.samples, 30)
+        # The networks look at the newest frame whenever they are free, not at every one.
+        self.assertTrue(2 <= state.animals[0].estimate.samples <= 30, state.animals[0].estimate.samples)
         written = Path(state.video_file)
         self.assertEqual(written.name, "свиньи" + MARKED_SUFFIX + ".mp4")
         self.assertEqual(written.parent.parent, self.output)
@@ -937,9 +955,15 @@ class CalibrationAndVideoTests(SessionTests):
         self.assertEqual(len(marked), 30)
         self.assertEqual(marked[0].shape, (side, side, 3))
         # The first frame: the body is tinted, the empty corner is left as it was.
-        inside, corner = (slice(690, 710), slice(590, 610)), (slice(1300, 1380), slice(1300, 1380))
-        self.assertGreater(np.abs(marked[0][inside].astype(int) - frames[0][inside]).mean(), 20)
+        corner = (slice(1300, 1380), slice(1300, 1380))
         self.assertLess(np.abs(marked[0][corner].astype(int) - frames[0][corner]).mean(), 8)
+        for step, (shown, original) in enumerate(zip(marked, frames)):
+            # Every frame, analysed or carried, is tinted where the body is in that frame and not where it was.
+            body = (slice(690, 710), slice(500 + 8 * step - 10, 500 + 8 * step + 10))
+            self.assertGreater(np.abs(shown[body].astype(int) - original[body]).mean(), 15, step)
+        left_behind = (slice(690, 710), slice(290, 310))
+        self.assertGreater(np.abs(marked[0][left_behind].astype(int) - frames[0][left_behind]).mean(), 15)
+        self.assertLess(np.abs(marked[29][left_behind].astype(int) - frames[29][left_behind]).mean(), 8)
         saved = json.loads((written.parent / "result.json").read_text(encoding="utf-8"))
         self.assertEqual((saved["source"], saved["frames"], len(saved["pigs"])), ("video", 30, 1))
         self.assertAlmostEqual(saved["pigs"][0]["mass_kg"], state.animals[0].estimate.mass_kg, delta=.1)
@@ -1028,9 +1052,9 @@ class DrawingTests(unittest.TestCase):
         self.assertEqual(label_text(4, None), "#4")
         row = pig_row(SimpleNamespace(track_id=2, estimate=estimate_of(6.), note="", in_view=True))
         self.assertEqual(row[1:3], ("6.0", "5.4–6.6"))
-        self.assertEqual(pig_row(SimpleNamespace(track_id=2, estimate=estimate_of(6.), note=WEIGHED, in_view=False))[6],
+        self.assertEqual(pig_row(SimpleNamespace(track_id=2, estimate=estimate_of(6.), note=WEIGHED, in_view=False))[7],
                          WEIGHED)
-        self.assertEqual(pig_row(SimpleNamespace(track_id=2, estimate=estimate_of(6.), note=CUT, in_view=False))[6], "")
+        self.assertEqual(pig_row(SimpleNamespace(track_id=2, estimate=estimate_of(6.), note=CUT, in_view=False))[7], "")
 
     def test_girth_is_marked_across_the_body_as_wide_as_the_body(self):
         shape = pig_shape(pig_mask())
@@ -1056,8 +1080,8 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(device_text("", None), "")
 
     def test_video_progress_tells_the_speed_and_the_time_left(self):
-        state = PigState(kind="video", playing=True, frame=100, frames=400, fps=5.)
-        self.assertEqual(progress_text(state), " 5.0 кадра/с, осталось около 1:00.")
+        state = PigState(kind="video", playing=True, frame=100, frames=400, fps=5., video_fps=25., analysis_fps=1.5)
+        self.assertEqual(progress_text(state), " Показ 5 из 25 кадров/с, нейросети 1.5 кадра/с, осталось около 1:00.")
         self.assertIn("45 %", progress_text(PigState(kind="video", finished=True, rendering=.45)))
         self.assertEqual(progress_text(PigState(kind="video", finished=True, fps=5.)), "")
 
@@ -1089,7 +1113,7 @@ class TabCalibrationTests(TabTests):
         self.assertEqual(self.tab.known(), (1, round(rough * 8, 3)))
         self.pump(lambda: "по весу свиньи №1" in self.tab.scale_text.get())
         self.assertEqual(self.row()[1], kg_text(rough * 8))
-        self.assertEqual(self.row()[6], WEIGHED)
+        self.assertEqual(self.row()[7], WEIGHED)
         self.tab.known_pig.set("1,5")
         self.assertIsNone(self.tab.known())
         self.pump(lambda: "приблизительный" in self.tab.scale_text.get())
@@ -1110,6 +1134,265 @@ class TabCalibrationTests(TabTests):
         self.assertIn("проверка", self.tab.device.get())
         self.show_photo()
         self.assertFalse(self.tab.video_actions.winfo_ismapped())
+
+
+
+class VolumeTests(unittest.TestCase):
+    def test_a_box_shaped_body_seen_from_above_has_the_volume_of_its_elliptic_slices(self):
+        mask = np.zeros((SIZE, SIZE), np.uint8)
+        cv2.rectangle(mask, (200, 305), (499, 394), 255, -1)
+        mask = mask > 0
+        (sample, why), _ = measured(mask, from_above(mask))
+        self.assertEqual(why, "")
+        width, length = 90 * 2.05 / FOCAL, 300 * 2.05 / FOCAL
+        expected = np.pi / 4 * width * width * DEPTH_TO_WIDTH * length
+        self.assertAlmostEqual(sample.volume_m3, expected, delta=expected * .06)
+        self.assertAlmostEqual(sample.mass_kg, sample.volume_m3 * BODY_DENSITY_KG_M3 * LEGS_FACTOR)
+
+    def test_a_narrow_head_weighs_less_than_a_body_as_wide_as_the_trunk(self):
+        pig = pig_mask()
+        (shaped, _), _ = measured(pig, from_above(pig))
+        block = np.zeros((SIZE, SIZE), np.uint8)
+        cv2.rectangle(block, (95, 305), (505, 394), 255, -1)
+        (boxy, _), _ = measured(block > 0, from_above(block > 0))
+        self.assertLess(shaped.volume_m3, boxy.volume_m3 * .95)
+
+    def test_volume_and_tape_agree_on_an_ordinary_pig(self):
+        pig = pig_mask()
+        (sample, _), _ = measured(pig, from_above(pig))
+        tape = tape_mass(sample.length_m, sample.girth_m)
+        self.assertAlmostEqual(sample.mass_kg, tape, delta=tape * .35)
+
+    def test_estimate_keeps_the_volume_and_scales_it_as_a_cube(self):
+        accumulator = PigAccumulator()
+        for volume in (.09, .1, .11):
+            accumulator.add(PigSample(1., 1.1, .3, 0., volume))
+        estimate = accumulator.estimate()
+        self.assertAlmostEqual(estimate.volume_l, 100.)
+        self.assertAlmostEqual(estimate.mass_kg, .1 * BODY_DENSITY_KG_M3 * LEGS_FACTOR)
+        self.assertAlmostEqual(estimate.scaled(2.).volume_l, 800.)
+
+
+class TrackingTests(unittest.TestCase):
+    def test_an_outline_follows_a_body_moving_across_the_frame(self):
+        frames = [textured(pig_mask(centre=(250 + 6 * step, 350)), 6 * step) for step in range(10)]
+        mask = pig_mask(centre=(250, 350))
+        shape = pig_shape(mask)
+        box = (-5., 290., 405., 410.)
+        steps = carried([(outline_contours(mask), shape, box)],
+                        [tracking_gray(frame)[0] for frame in frames], tracking_gray(frames[0])[1])
+        self.assertEqual(len(steps), 10)
+        last = steps[-1][0]
+        self.assertGreater(len(last.points), 10)
+        for before, after in ((shape.neck, last.now_shape.neck), (shape.rump, last.now_shape.rump)):
+            self.assertAlmostEqual(after[0], before[0] + 54, delta=4)
+            self.assertAlmostEqual(after[1], before[1], delta=4)
+        self.assertAlmostEqual(last.now_shape.girth_px, shape.girth_px, delta=shape.girth_px * .05)
+
+    def test_motions_compose_and_a_grown_body_has_wider_slices(self):
+        shift = np.array(((1., 0., 10.), (0., 1., 0.)))
+        grow = np.array(((2., 0., 0.), (0., 2., 0.)))
+        self.assertTrue(np.allclose(compose(grow, shift), ((2., 0., 20.), (0., 2., 0.))))
+        shape = pig_shape(pig_mask())
+        bigger = moved_shape(shape, grow)
+        self.assertAlmostEqual(bigger.girth_px, shape.girth_px * 2)
+        self.assertAlmostEqual(bigger.slices[5], shape.slices[5] * 2)
+        self.assertIsNone(moved_shape(None, IDENTITY))
+
+    def test_a_flat_outline_without_anything_to_follow_stays_where_it_was(self):
+        frame = picture(pig_mask())
+        gray, scale = tracking_gray(frame)
+        item = follower(outline_contours(pig_mask()), None, (95., 290., 505., 410.), gray, scale)
+        moved = follow(gray, gray, [item], scale)[0]
+        self.assertTrue(np.allclose(moved.matrix, IDENTITY))
+
+
+class SlowDetector(FakeDetector):
+    """Neural networks that take their time, as they do on a processor."""
+
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def depth(self, image):
+        time.sleep(self.seconds)
+        return super().depth(image)
+
+
+class PlaybackTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+
+    def tearDown(self):
+        self.session.stop()
+        self.session.join(timeout=5)
+        self.temp.cleanup()
+
+    def start(self, seconds):
+        self.session = PigSession(lambda status: SlowDetector(seconds), Path(self.temp.name) / "output")
+        self.session.start()
+        self.session.set_active(True)
+        end = time.monotonic() + 10
+        while not self.session.state.ready and time.monotonic() < end:
+            time.sleep(.01)
+
+    def play(self, frames, fps):
+        path = Path(self.temp.name) / "pigs.avi"
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (SIZE, SIZE))
+        for step in range(frames):
+            writer.write(textured(pig_mask(centre=(250 + 3 * step, 350), scale=.8), 3 * step))
+        writer.release()
+        started = time.monotonic()
+        self.session.post("video", path)
+        end = started + 30
+        shown = set()
+        while time.monotonic() < end:
+            state = self.session.state
+            shown.add(state.frame)
+            if state.finished and state.rendering is None and state.video_file:
+                return state, time.monotonic() - started, shown
+            time.sleep(.005)
+        self.fail(f"the video did not end: {self.session.state.message}")
+
+    def test_slow_networks_do_not_hold_the_video_back_and_every_frame_gets_its_outline(self):
+        self.start(.25)
+        state, elapsed, shown = self.play(40, 20.)
+        self.assertLess(elapsed, 40 * .25)
+        self.assertLess(state.animals[0].estimate.samples, 20)
+        self.assertEqual(sorted(self.session.marks), list(range(40)))
+        self.assertTrue(all(self.session.marks[index] for index in range(40)))
+        self.assertGreater(len(shown), 25)
+
+    def test_slow_networks_slow_the_video_evenly_instead_of_in_jumps(self):
+        session = PigSession(lambda status: FakeDetector())
+        session.networks = SimpleNamespace(count=2)
+        session.fps = 25.
+        self.session = SimpleNamespace(stop=lambda: None, join=lambda timeout: None)
+        self.assertAlmostEqual(session.interval(), 1 / 25)
+        session.merge_gap = 4.
+        self.assertAlmostEqual(session.interval(), 1 / (25 * .25 * .9))
+        session.merge_gap = .01
+        self.assertAlmostEqual(session.interval(), 1 / 25)
+
+    def test_the_video_waits_rather_than_carry_outlines_too_far(self):
+        self.start(.15)
+        with patch("stereo.pig_weighing.MAX_LAG_S", .02):
+            state, elapsed, _ = self.play(30, 100.)
+        # At its own rate the video lasts 0.3 s; two frames per pass of the networks take longer.
+        self.assertGreater(elapsed, 1.5)
+        self.assertEqual(sorted(self.session.marks), list(range(30)))
+
+
+def raw_row(track_id, mass, source=PICTURE) -> PigRow:
+    return PigRow(track_id, estimate_of(mass * 2), "", True, estimate_of(mass), source)
+
+
+class PigDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.database = PigDatabase(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_records_keep_the_estimate_before_correction_and_come_back_newest_first(self):
+        self.assertEqual(self.database.entries(), [])
+        first = self.database.add(make_entry(raw_row(2, 1.), "8", "№2", "video", "test"))
+        second = self.database.add(make_entry(raw_row(3, 1.2), "9,5", "№3", "photo", "test"))
+        entries = self.database.entries()
+        self.assertEqual([entry.id for entry in entries], [second, first])
+        self.assertEqual((entries[1].real_weight_kg, entries[1].estimated_weight_kg, entries[1].scale), (8., 1., PICTURE))
+        self.assertAlmostEqual(entries[1].length_factor, 2.)
+        self.database.delete(second)
+        self.assertEqual([entry.id for entry in self.database.entries()], [first])
+        self.assertTrue((Path(self.temp.name) / "data" / "pigs" / "pigs.sqlite").is_file())
+
+    def test_typing_slips_and_unmeasured_pigs_are_refused(self):
+        for text in ("", "abc", "0", "1000"):
+            with self.assertRaises(ValueError):
+                make_entry(raw_row(2, 1.), text, "", "video", "test")
+        with self.assertRaises(ValueError):
+            make_entry(PigRow(2, None, "", True), "8", "", "video", "test")
+        with self.assertRaises(ValueError):
+            make_entry(None, "8", "", "video", "test")
+
+    def test_correction_is_the_middle_of_the_records_of_the_same_kind(self):
+        entries = [make_entry(raw_row(index, 1.), str(mass), "", "video", "test")
+                   for index, mass in enumerate((8., 8. * 1.1 ** 3, 8. / 1.1 ** 3))]
+        # A slip: the pig on the scales was not the one numbered, so the ratio is beyond belief.
+        entries.append(make_entry(raw_row(5, .001), "300", "", "video", "test"))
+        entries.append(make_entry(raw_row(9, 1., STEREO), "1", "", "camera", "test"))
+        found = correction(entries, PICTURE)
+        self.assertAlmostEqual(found.factor, 2., places=6)
+        self.assertEqual(found.count, 3)
+        self.assertAlmostEqual(found.spread, (2.2 - 2 / 1.1) / 4, places=6)
+        self.assertAlmostEqual(correction(entries, STEREO).factor, 1.)
+        self.assertIsNone(correction([], PICTURE))
+        text = summary_text(entries[:1], PICTURE)
+        self.assertIn("×2,00", text)
+        self.assertIn("хотя бы 3", text)
+        self.assertIn("Добавить в базу", summary_text([], PICTURE))
+
+    def test_spreadsheet_gets_one_row_per_pig(self):
+        self.database.add(make_entry(raw_row(2, 1.), "8", "=№2", "video", "test"))
+        target = Path(self.temp.name) / "pigs.csv"
+        self.assertEqual(export_csv(self.database.entries(), target), 1)
+        lines = target.read_text(encoding="utf-8-sig").splitlines()
+        self.assertTrue(lines[0].startswith("id;created;label;real_weight_kg"))
+        self.assertIn(";'=№2;8.0;picture;", lines[1])
+
+
+class LearnedScaleTests(CalibrationAndVideoTests):
+    """Pigs weighed earlier correct a later picture of the same place."""
+    test_one_animal_weighed_on_scales_sets_the_scale_of_all = None
+    test_every_frame_of_a_video_is_shown_and_written_again_marked_where_the_pig_is = None
+    test_a_segment_marked_after_the_video_rescales_every_frame_already_seen = None
+    test_rewinding_starts_the_analysis_and_the_numbers_again = None
+
+    def test_correction_from_the_database_applies_only_while_the_scale_is_guessed(self):
+        self.session.post("photo", self.photo(picture(pig_mask(scale=.8))))
+        rough = self.wait(lambda state: state.animals and state.animals[0].estimate).animals[0]
+        self.assertAlmostEqual(rough.raw.mass_kg, rough.estimate.mass_kg)
+        self.session.post("learned", (2., 4, .1))
+        state = self.wait(lambda state: state.scale_source == LEARNED)
+        self.assertEqual(state.learned_pigs, 4)
+        self.assertAlmostEqual(state.animals[0].estimate.mass_kg, rough.estimate.mass_kg * 8, delta=.01)
+        self.assertAlmostEqual(state.animals[0].raw.mass_kg, rough.raw.mass_kg)
+        self.assertIn("взвешенных свиней 4", scale_text(state))
+        self.session.post("reference", (SEGMENT_PIXELS, SEEN_SEGMENT_M * 3))
+        state = self.wait(lambda state: state.scale_source == SEGMENT)
+        self.assertAlmostEqual(state.animals[0].estimate.mass_kg, rough.estimate.mass_kg * 27, delta=rough.estimate.mass_kg * .2)
+        self.session.post("reference", None)
+        self.session.post("learned", None)
+        self.wait(lambda state: state.scale_source == PICTURE)
+
+
+class TabDatabaseTests(TabCalibrationTests):
+    test_typed_weight_of_one_animal_rescales_the_table = None
+    test_finished_video_offers_to_write_it_again_and_to_open_it = None
+
+    def test_weighed_pig_goes_to_the_database_and_corrects_the_next_picture(self):
+        self.open_with_models()
+        self.assertIn("пока нет свиней", self.tab.database_text.get())
+        self.show_photo()
+        rough = self.tab.state.animals[0].estimate.mass_kg
+        self.tab.add_to_database()
+        self.assertIn("Введите номер", self.tab.message.get())
+        self.tab.known_pig.set("1")
+        self.tab.known_mass.set(f"{rough * 2:.2f}")
+        self.tab.add_to_database()
+        self.assertIn("добавлена в базу", self.tab.message.get())
+        self.assertIn("В базе свиней: 1", self.tab.database_text.get())
+        self.assertEqual(len(PigDatabase(self.temp.name).entries()), 1)
+        # Another picture: its numbers are new, the weight typed for this one no longer applies.
+        self.tab.forget_segment()
+        self.show_photo()
+        self.pump(lambda: "поправлен по базе" in self.tab.scale_text.get())
+        self.assertAlmostEqual(self.tab.state.animals[0].estimate.mass_kg, rough * 2, delta=rough * .05)
+        self.tab.export_database()
+        self.assertTrue(list((Path(self.temp.name) / "output").glob("pigs_database_*.csv")))
+        self.tab.remove_last()
+        self.assertEqual(PigDatabase(self.temp.name).entries(), [])
+        self.pump(lambda: "приблизительный" in self.tab.scale_text.get())
 
 
 if __name__ == "__main__":
