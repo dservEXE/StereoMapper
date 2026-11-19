@@ -3,8 +3,16 @@
 D-FINE trained on Objects365 knows pigs, which the people detector does not. SlimSAM, shared with
 the people tab, traces every found animal from one pass over the picture. Depth Anything gives
 metres from the camera for every pixel of an ordinary photograph. All are downloaded on request.
+
+Depth Anything Small learned rooms of a synthetic set, and on a pen of piglets it took the
+camera to stand 22 cm above the floor: the pigs came out half their size and a fifth of their
+weight. Apple Depth Pro, far larger, also tells the field of view of the camera, and on the same
+picture gave sizes as a tape would. It is optional, as its licence allows research use only, and
+too slow for every frame: it sets the scale from a few frames, the small model does the rest.
 """
 from contextlib import nullcontext
+import gc
+import math
 import os
 from types import SimpleNamespace
 
@@ -22,6 +30,9 @@ DEPTH = ModelSource("depth-anything-v2-metric-indoor-small", "depth-anything/Dep
                     "8078d68a9c75a972131914f6afd0c1723be0da7f",
                     99173660, "e990eb82fbf11b05b7813261196a2b841bdcf5a05f64396724a8987fa90504a3")
 SOURCES = (DETECTOR, SEGMENTER, DEPTH)
+REFERENCE = ModelSource("depth-pro", "apple/DepthPro-hf", "de816c8ce7168afcb231f96d501d72b869d0beda",
+                        1904185492, "9c6811e3165485b9a94a204329860cb333a79877e757eb795a179a4ea34bbcf7")
+REFERENCE_SIZE = 1536
 PIG_LABEL = "Pig"
 # Seen from above, a pig is often taken for another four-legged animal. On this tab they are all pigs.
 LOOKALIKE_LABELS = ("Sheep", "Cow", "Dog", "Bear", "Horse", "Donkey", "Yak", "Elephant", "Antelope", "Deer", "Cat")
@@ -50,6 +61,12 @@ def missing_size_mb(root) -> int:
                if not (model_path(root, source) / WEIGHTS_FILE).is_file()
                or (model_path(root, source) / WEIGHTS_FILE).stat().st_size != source.weights_size]
     return round(sum(source.weights_size for source in missing) / 1e6)
+
+
+def reference_ready(root) -> bool:
+    directory = model_path(root, REFERENCE)
+    weights = directory / WEIGHTS_FILE
+    return (directory / "config.json").is_file() and weights.is_file() and weights.stat().st_size == REFERENCE.weights_size
 
 
 def overlap(a, b) -> float:
@@ -106,6 +123,8 @@ class PigDetector:
 
     def __init__(self, root, status=lambda message: None):
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+        self.root = root
+        self.reference = None
         import torch
         from transformers import (AutoImageProcessor, AutoModelForDepthEstimation, DFineForObjectDetection,
                                   RTDetrImageProcessor, SamImageProcessor, SamModel, SamProcessor)
@@ -240,3 +259,65 @@ class PigDetector:
             full = torch.nn.functional.interpolate(predicted.unsqueeze(1).float(), size=bgr.shape[:2], mode="bilinear",
                                                    align_corners=False)[0, 0]
         return full.cpu().numpy().astype(np.float32)
+
+    # The reference for the scale.
+    @property
+    def reference_ready(self) -> bool:
+        return reference_ready(self.root)
+
+    def load_reference(self) -> None:
+        """Depth Pro, on the card where it fits, else on the processor; loaded when first needed."""
+        if self.reference is not None:
+            return
+        from transformers import DepthProForDepthEstimation
+        torch = self.torch
+        cuda = self.device == "cuda"
+        model = DepthProForDepthEstimation.from_pretrained(
+            model_path(self.root, REFERENCE), local_files_only=True, use_safetensors=True,
+            torch_dtype=torch.float16 if cuda else torch.float32).eval()
+        device = "cpu"
+        if self.device != "cpu":
+            try:
+                model.to(self.device)
+                device = self.device
+            except Exception:  # noqa: BLE001 - too little memory on the card: the processor will do.
+                model.to("cpu")
+        self.reference = (model, device, torch.float16 if device == "cuda" else torch.float32)
+
+    def release_reference(self) -> None:
+        """Depth Pro holds gigabytes; it goes once the scale of the source is known."""
+        self.reference = None
+        gc.collect()
+        if self.device == "cuda":
+            self.torch.cuda.empty_cache()
+
+    def reference_depth(self, bgr) -> tuple:
+        """(metres from the camera for every pixel, focal length in pixels) by Depth Pro.
+
+        Its own image steps need torchvision, which the application does not ship; these are the
+        same steps: scale to -1..1, then stretch to 1536 x 1536, and the field of view turns the
+        output into metres.
+        """
+        torch = self.torch
+        self.load_reference()
+        model, device, floats = self.reference
+        height, width = bgr.shape[:2]
+        rgb = (cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255 - .5) / .5
+        pixels = torch.nn.functional.interpolate(torch.from_numpy(rgb.transpose(2, 0, 1).copy())[None],
+                                                 size=(REFERENCE_SIZE, REFERENCE_SIZE), mode="bilinear")
+        try:
+            with torch.no_grad():
+                output = model(pixel_values=pixels.to(device, floats))
+        except Exception:  # noqa: BLE001 - a card can run out of memory on a large model.
+            if device == "cpu":
+                raise
+            model.to("cpu", torch.float32)
+            self.reference = (model, "cpu", torch.float32)
+            with torch.no_grad():
+                output = model(pixel_values=pixels)
+        fov = float(output.field_of_view[0].float().cpu())
+        focal = .5 * width / math.tan(.5 * math.radians(fov))
+        with torch.no_grad():
+            inverse = output.predicted_depth[0].float().cpu() * width / focal
+            inverse = torch.nn.functional.interpolate(inverse[None, None], size=(height, width), mode="bilinear")[0, 0]
+        return (1 / torch.clamp(inverse, 1e-4, 1e4)).numpy().astype(np.float32), focal

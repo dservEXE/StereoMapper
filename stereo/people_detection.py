@@ -74,8 +74,11 @@ def models_ready(root, sources=None) -> bool:
     return True
 
 
-def fetch(url, target, opener=urllib.request.urlopen) -> str:
-    """Download to a temporary name, returning the SHA-256; only verified files are renamed."""
+def fetch(url, target, opener=urllib.request.urlopen, progress=None) -> str:
+    """Download to a temporary name, returning the SHA-256; only verified files are renamed.
+
+    progress, if given, is told the share received, for a file large enough to wait for.
+    """
     digest = hashlib.sha256()
     request = urllib.request.Request(url, headers={"User-Agent": "StereoMapper-Models"})
     received = 0
@@ -86,6 +89,8 @@ def fetch(url, target, opener=urllib.request.urlopen) -> str:
             digest.update(block)
             output.write(block)
             received += len(block)
+            if progress is not None and expected:
+                progress(received / int(expected))
     # A dropped connection ends the read without an error, and would pass for a complete file.
     if expected is not None and received != int(expected):
         raise ValueError("связь прервалась")
@@ -93,6 +98,7 @@ def fetch(url, target, opener=urllib.request.urlopen) -> str:
 
 
 def download_models(root, status=lambda message: None, opener=urllib.request.urlopen, sources=None) -> None:
+    """Fetch and check every model not yet here; a large file reports how far it is."""
     for source in sources or SOURCES:
         directory = model_path(root, source)
         directory.mkdir(parents=True, exist_ok=True)
@@ -103,8 +109,15 @@ def download_models(root, status=lambda message: None, opener=urllib.request.url
                 continue
             status(f"Скачиваю {source.repository}: {name}…")
             partial = directory / (name + ".part")
+            shown = [-1]
+
+            def progress(share, name=name, source=source):
+                percent = int(share * 100)
+                if percent != shown[0]:
+                    shown[0] = percent
+                    status(f"Скачиваю {source.repository}: {name}, {percent} %")
             try:
-                digest = fetch(source.url(name), partial, opener)
+                digest = fetch(source.url(name), partial, opener, progress if weights else None)
                 if weights and digest != source.weights_sha256:
                     raise ValueError("контрольная сумма не совпала")
                 if not weights:
