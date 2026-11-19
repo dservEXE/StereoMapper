@@ -6,6 +6,8 @@ ViTPose+ small, usyd-community/vitpose-plus-small, Apache-2.0
 SlimSAM uniform-77, Zigeng/SlimSAM-uniform-77, Apache-2.0
 D-FINE medium Objects365, ustc-community/dfine-medium-obj365, Apache-2.0 (pig weighing tab)
 Depth Anything V2 Metric Indoor Small, depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf, Apache-2.0 (pig weighing tab)
+Depth Pro, apple/DepthPro-hf, Apple Machine Learning Research Model License: research use only (pig weighing tab,
+optional; downloaded only after the owner agrees to these terms in the tab)
 
 Optional accelerator packs. They are not bundled either: the application downloads them on request
 from the addresses in stereo/gpu_pack.py and checks each file by SHA-256.

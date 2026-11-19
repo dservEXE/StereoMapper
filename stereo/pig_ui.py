@@ -5,17 +5,17 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 import tkinter as tk
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 
 from .gpu_pack import installed_pack
 from .people_detection import download_models, models_ready
 from .pig_database import PigDatabase, correction, export_csv, make_entry, summary_text
-from .pig_detection import SOURCES, missing_size_mb
+from .pig_detection import REFERENCE, SOURCES, missing_size_mb, reference_ready
 from .pig_drawing import draw_marks, kg_text, label_text
-from .pig_weighing import (LEARNED, PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED, WEIGHT, WEIGHT_FAILED, PigSession,
-                           result_folder, write_result)
+from .pig_weighing import (AUTO, LEARNED, PICTURE, SEGMENT, SEGMENT_FAILED, STEREO, WEIGHED, WEIGHT, WEIGHT_FAILED,
+                           PigSession, result_folder, write_result)
 from .ui import note
 from .version import VERSION
 
@@ -36,11 +36,16 @@ SCALE_TEXTS = {
     SEGMENT_FAILED: "Отрезок измерить не удалось. Отметьте его на неподвижном, хорошо видном предмете.",
     WEIGHT: "Масштаб уточнён по весу свиньи №{pig}: остальные пересчитаны по ней.",
     WEIGHT_FAILED: "Свинья с этим номером ещё не измерена, по ней масштаб не уточнить. Выберите номер с весом из таблицы.",
+    AUTO: "Масштаб определила эталонная модель Depth Pro, без весов и отрезка. Взвешенная на весах свинья "
+          "уточнит его ещё.",
     LEARNED: "Масштаб поправлен по базе: взвешенных свиней {learned}. Для другого места или камеры поправка может не "
              "подойти: тогда взвесьте здесь одну свинью.",
 }
 NO_CAMERA = "Сначала подключите камеры на вкладке «1 Камеры»."
 ACCELERATION = "комплект на вкладке «Дополнительно»"
+REFERENCE_LICENCE = ("Эталонная модель Apple Depth Pro, 1,9 ГБ, сама определяет масштаб сцены. Её лицензия (Apple Machine "
+                     "Learning Research Model License) разрешает только некоммерческие научные исследования. "
+                     "Скачать и использовать её на этих условиях?")
 
 
 def parse_number(text) -> float | None:
@@ -101,16 +106,15 @@ def device_text(device, pack) -> str:
 
 
 def progress_text(state) -> str:
-    """How fast the video goes against its own rate, how fast the networks look, and how long is left."""
+    """How far the analysis of a video is and how long is left, or how far its writing is."""
     if state.rendering is not None:
         return f" Записываю видео с разметкой: {state.rendering * 100:.0f} %."
     if state.kind == "camera" and state.fps:
         return f" {state.fps:.1f} кадра/с."
-    if state.kind != "video" or state.finished or not state.playing or not state.fps:
+    if state.kind != "video" or state.finished or state.replaying or not state.playing or not state.fps:
         return ""
     left = max(0, state.frames - state.frame) / state.fps
-    networks = f", нейросети {state.analysis_fps:.1f} кадра/с" if state.analysis_fps else ""
-    return f" Показ {state.fps:.0f} из {state.video_fps:.0f} кадров/с{networks}, осталось около {time_text(left)}."
+    return f" {state.fps:.1f} кадра/с, осталось около {time_text(left)}."
 
 
 class PigTab:
@@ -163,6 +167,10 @@ class PigTab:
         self.rewind_button.grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
         self.controls_shown = False
         section(sidebar, "Точность")
+        self.reference_text = tk.StringVar()
+        ttk.Label(sidebar, textvariable=self.reference_text, style="Muted.TLabel", wraplength=WRAP, justify="left").pack(anchor="w", fill="x")
+        self.reference_button = action(sidebar, f"Скачать эталонную модель ({REFERENCE.weights_size / 1e9:.1f} ГБ)".replace(".", ","),
+                                       self.start_reference_download)
         note(sidebar, "Обычная камера не знает, насколько далеко свиньи, и без подсказки вес может ошибаться в разы. "
                       "Проще всего взвесить одну свинью на весах и ввести её номер и вес: остальные пересчитаются по ней.")
         known = ttk.Frame(sidebar)
@@ -223,6 +231,7 @@ class PigTab:
             variable.trace_add("write", lambda *_: self.apply_known())
         app.workflow.bind("<<NotebookTabChanged>>", lambda event: self.sync(), add="+")
         self.show_download_state()
+        self.show_reference_state()
 
     def build_metrics(self, parent) -> None:
         row = ttk.Frame(parent)
@@ -244,6 +253,33 @@ class PigTab:
             self.download_button.configure(text=f"Скачать модели ({size} МБ)")
             self.message.set(f"Для поиска свиней нужны модели, {size} МБ. Они скачиваются один раз и работают "
                              "на этом компьютере; кадры никуда не передаются.")
+
+    def show_reference_state(self) -> None:
+        if reference_ready(self.app.directory):
+            self.reference_button.pack_forget()
+            self.reference_text.set("Эталонная модель Depth Pro установлена: масштаб каждого фото и видео она "
+                                    "определяет сама, по одному кадру на процессоре и трём на видеокарте.")
+        elif not self.downloading:
+            self.reference_text.set("Чтобы вес был верным сразу, без весов и отрезка, скачайте эталонную модель Depth Pro. "
+                                    "Лицензия Apple разрешает её только для некоммерческих исследований.")
+
+    def start_reference_download(self) -> None:
+        if self.downloading:
+            return
+        if not messagebox.askyesno("Эталонная модель", REFERENCE_LICENCE, parent=self.page):
+            return
+        self.downloading = True
+        self.reference_button.configure(state="disabled")
+        self.reference_text.set("Скачиваю эталонную модель…")
+
+        def work():
+            try:
+                download_models(self.app.directory, lambda text: self.downloads.put(("status", text)),
+                                sources=(REFERENCE,))
+                self.downloads.put(("done", "Эталонная модель скачана. Откройте фото или видео заново."))
+            except Exception as error:  # noqa: BLE001 - the button must never stay blocked.
+                self.downloads.put(("done", str(error)))
+        Thread(target=work, daemon=True, name="pig-reference-download").start()
 
     def start_download(self) -> None:
         if self.downloading:
@@ -411,8 +447,9 @@ class PigTab:
         except Exception as error:  # noqa: BLE001 - a damaged base must not stop the weighing.
             self.database_text.set(f"Базу свиней не прочитать: {error}")
             return
-        self.database_text.set(summary_text(entries, PICTURE))
-        learned = correction(entries, PICTURE)
+        self.database_text.set(summary_text(entries, AUTO if reference_ready(self.app.directory) else PICTURE))
+        # Each kind of guessed scale has its own error: the records correct only their own kind.
+        learned = {scale: correction(entries, scale) for scale in (PICTURE, AUTO)}
         if self.session is not None:
             self.sent_learned = learned
             self.session.post("learned", learned)
@@ -494,7 +531,9 @@ class PigTab:
                 if kind == "done":
                     self.downloading = False
                     self.download_button.configure(state="normal")
+                    self.reference_button.configure(state="normal")
                     self.show_download_state()
+                    self.show_reference_state()
         except Empty:
             pass
         self.sync()
@@ -507,7 +546,7 @@ class PigTab:
         video = state.kind == "video"
         self.show_controls(video)
         self.play_button.configure(text="Пауза" if state.playing else "Продолжить",
-                                   state="disabled" if state.finished else "normal")
+                                   state="disabled" if state.rendering is not None else "normal")
         busy = state.rendering is not None
         self.render_button.configure(state="normal" if state.finished and not busy else "disabled")
         self.open_video_button.configure(state="normal" if state.video_file and not busy else "disabled")
@@ -524,7 +563,7 @@ class PigTab:
             self.table.insert("", "end", values=pig_row(pig))
         self.table.yview_moveto(top)
         masses = [pig.estimate.mass_kg for pig in state.animals if pig.estimate is not None]
-        self.metric_count.set(str(len(state.pigs)) if state.image is not None else NO_VALUE)
+        self.metric_count.set(str(state.in_frame) if state.image is not None else NO_VALUE)
         self.metric_mean.set(f"~{kg_text(sum(masses) / len(masses))} кг" if masses else NO_VALUE)
         if state.image is None:
             self.panel.clear()
